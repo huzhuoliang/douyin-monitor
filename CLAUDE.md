@@ -6,6 +6,28 @@
 
 ---
 
+## Sensitive Data & Desensitization Rules
+
+The following information is **never committed to git**. Real values live in local-only files.
+
+| Category | Placeholder in repo | Real value location |
+|----------|--------------------|--------------------|
+| Streamer room IDs & names | `ROOM_ID_1`, `主播A/B/C` | `config.json`, `CLAUDE.local.md` |
+| Local file paths (username) | `/path/to/recordings`, `YOUR_USERNAME` | `config.json`, `CLAUDE.local.md` |
+| Feishu webhook URL | `null` / omitted | `config.json`, `CLAUDE.local.md` |
+| NAS host / dest dir | generic descriptions | `config.json`, `CLAUDE.local.md` |
+
+**Gitignored files** (exist on disk, never pushed):
+- `config.json` — runtime config with real values; use `config.example.json` as template
+- `CLAUDE.local.md` — personal deployment notes (paths, streamer list, credentials)
+
+**When adding new sensitive fields** to `config.json`:
+1. Keep the field in `config.example.json` with a `null` or placeholder value
+2. Add a row to the table above
+3. Document the real value in `CLAUDE.local.md` if useful for reference
+
+---
+
 ## File Map
 
 | File | Role |
