@@ -10,6 +10,8 @@
 douyin_monitor/
 ├── config.json      # 配置文件（主播 URL、输出目录、轮询间隔等）
 ├── monitor.py       # 主监控脚本
+├── danmaku.py       # 弹幕录制模块（由 monitor.py 调用）
+├── login.py         # 弹幕 Cookie 获取助手（手动运行一次）
 ├── status.py        # 状态查看工具（需安装为 douyin-status 命令）
 ├── install.sh       # 一键安装脚本
 └── README.md        # 本文档
@@ -330,6 +332,66 @@ sudo systemctl daemon-reload && sudo systemctl restart douyin-monitor
 ```bash
 pip3 install anthropic --break-system-packages
 ```
+
+---
+
+## 弹幕录制
+
+当 `danmaku_enabled` 设为 `true`，每次录制开始时会同步连接 Douyin WebSocket，将弹幕实时写入与 MP4 同名的 `.danmaku.jsonl` 文件：
+
+```
+抖音_主播名_20260308_153045.mp4
+抖音_主播名_20260308_153045.danmaku.jsonl   ← 自动生成
+```
+
+每行一条消息，格式：
+
+```jsonl
+{"ts": 1741430400.12, "type": "chat",    "user": {"id": 123, "nickname": "xxx"}, "content": "哈哈哈"}
+{"ts": 1741430401.50, "type": "gift",    "user": {...}, "gift_id": 1234, "repeat_count": 1}
+{"ts": 1741430402.00, "type": "viewers", "total": 12345}
+```
+
+消息类型：`chat`（聊天）、`gift`（礼物）、`like`（点赞）、`member`（进场）、`social`（关注）、`viewers`（在线人数）、`control`（控制，如直播结束）
+
+**弹幕连接需要登录 Cookie**，否则 WebSocket 握手返回 `auth failed 417`。
+
+### 获取登录 Cookie
+
+运行辅助脚本，按提示将浏览器 Cookie 粘贴进去，约 30 秒完成：
+
+```bash
+python3 login.py
+```
+
+操作步骤：
+1. 用电脑浏览器打开 `https://live.douyin.com/`（确保已登录抖音）
+2. 按 `F12` → 切换到「网络 Network」标签 → 按 `F5` 刷新
+3. 点击任意一条发往 `live.douyin.com` 的请求
+4. 在右侧「请求标头 Request Headers」中找到 `cookie:` 行
+5. 复制 `cookie:` 后面的完整字符串
+6. 粘贴到脚本提示符后，按回车
+
+脚本会自动验证 Cookie 并写入 `config.json`，然后提示重启服务。
+
+```bash
+python3 login.py --qr   # 实验性：扫码模式（可能因 bot 防护失败）
+```
+
+### 配置字段
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `danmaku_enabled` | `false` | 总开关 |
+| `danmaku_cookies` | `null` | 登录 Cookie 字符串（由 `login.py` 写入） |
+
+### 弹幕合并
+
+多段录制时（同一场直播因网络中断导致多个 MP4 分段），后处理阶段会将对应的 `.danmaku.jsonl` 文件按时间顺序拼接，连同 MP4 一起上传到 NAS。
+
+### 重启恢复
+
+服务重启时，若上次有进行中的录制，弹幕录制会自动从同一 `.danmaku.jsonl` 文件末尾继续追加，不丢失已有内容。
 
 ---
 

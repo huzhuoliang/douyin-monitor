@@ -304,14 +304,14 @@ Fields saved:
 | `consecutive_offline` | Adaptive polling counter — survives restart without resetting to 60s |
 | `offline_since` | Wall time of offline transition — post-process delay continues counting |
 | `session_files` | List of recorded segments — not lost if service restarts between segments |
-| `current_recording` | `{path, rec_start_ts}` of the active recording — enables watermark recovery |
+| `current_recording` | `{path, rec_start_ts}` of the active recording — recovered into `_session_files` on restart |
 
 **Write path**: every meaningful state change calls `_save_state()` which writes to `{path}.tmp` then `os.replace()` (atomic). No partially-written state files.
 
 **Recovery flow** (at `run()` startup):
 1. `_load_state()` restores all four fields
 2. If `current_recording` is non-None → interrupted recording detected:
-   - File exists on disk → apply watermark (if `timestamp_watermark` enabled), add to `_session_files`
+   - File exists on disk → add to `_session_files` (watermark 统一在 `_post_process_session` Step 0 执行)
    - File missing → log warning, skip
    - Clear `current_recording`, save state
 3. Main poll loop starts with fully restored state

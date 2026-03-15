@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 from datetime import datetime
+
+from danmaku import DanmakuRecorder
 from pathlib import Path
 
 _shutdown_event = threading.Event()
@@ -125,6 +127,7 @@ class StreamerMonitor:
         self._rec_start_ts: int | None = None     # Unix timestamp when current recording started
         self._consecutive_offline: int = 0        # persisted across restarts for adaptive polling
         self._current_recording: dict | None = None  # {"path": ..., "rec_start_ts": ...}
+        self._danmaku_recorder: DanmakuRecorder | None = None
         self._phase: str = "STARTING"
         self._phase_since: float = time.time()
         self._phase_detail: str | None = None
@@ -212,6 +215,15 @@ class StreamerMonitor:
             self._rec_start_ts = int(time.time())
             self._current_recording = {"path": output_path, "rec_start_ts": self._rec_start_ts}
             self._save_state()
+
+            if self.config.get("danmaku_enabled", False):
+                if self._danmaku_recorder is not None:
+                    self._danmaku_recorder.stop()
+                    self._danmaku_recorder = None
+                danmaku_path = os.path.splitext(output_path)[0] + ".danmaku.jsonl"
+                self._danmaku_recorder = DanmakuRecorder(self.url, danmaku_path, self.config, self.label)
+                self._danmaku_recorder.start()
+
             return True
         except Exception as e:
             self.log(logging.ERROR, "Failed to start recording: %s", e)
@@ -339,6 +351,10 @@ class StreamerMonitor:
 
     def stop(self) -> None:
         """Terminate streamlink so the pipe closes; ffmpeg will see EOF and finalize the MP4 naturally."""
+        if self._danmaku_recorder is not None:
+            self._danmaku_recorder.stop()
+            self._danmaku_recorder = None
+
         if self._sl_pgid is not None:
             try:
                 os.killpg(self._sl_pgid, signal.SIGTERM)
@@ -457,6 +473,31 @@ class StreamerMonitor:
                     )
                     return
 
+            # Danmaku merge (mirrors MP4 merge logic)
+            merged_danmaku_path = None
+            if self.config.get("danmaku_enabled", False):
+                danmaku_segments = [os.path.splitext(f)[0] + ".danmaku.jsonl" for f in valid_files]
+                existing_danmaku = [d for d in danmaku_segments if os.path.exists(d)]
+                if existing_danmaku:
+                    if len(valid_files) == 1 or len(existing_danmaku) == 1:
+                        merged_danmaku_path = existing_danmaku[0]
+                    else:
+                        danmaku_merged_name = os.path.splitext(os.path.basename(merged_path))[0] + ".danmaku.jsonl"
+                        merged_danmaku_path = str(output_dir / danmaku_merged_name)
+                        self.log(logging.INFO, "Merging %d danmaku file(s) → %s",
+                                 len(existing_danmaku), danmaku_merged_name)
+                        with open(merged_danmaku_path, "w", encoding="utf-8") as out_f:
+                            for df in existing_danmaku:
+                                try:
+                                    with open(df, encoding="utf-8") as in_f:
+                                        for line in in_f:
+                                            stripped = line.strip()
+                                            if stripped:
+                                                out_f.write(stripped + "\n")
+                                except Exception as e:
+                                    self.log(logging.WARNING, "Could not read danmaku segment %s: %s",
+                                             os.path.basename(df), e)
+
             # Step 3: Upload
             if _shutdown_event.is_set():
                 self.log(logging.WARNING, "Shutdown detected, aborting post-processing (before upload)")
@@ -501,6 +542,27 @@ class StreamerMonitor:
                 )
                 return
 
+            # Upload danmaku file alongside MP4 (non-fatal if absent or fails)
+            if merged_danmaku_path and os.path.exists(merged_danmaku_path):
+                if len(valid_files) > 1:
+                    nas_danmaku_name = os.path.basename(merged_danmaku_path).replace(
+                        "_merged.danmaku.jsonl", ".danmaku.jsonl"
+                    )
+                else:
+                    nas_danmaku_name = os.path.basename(merged_danmaku_path)
+                danmaku_rsync = subprocess.run(
+                    ["rsync", "-av", "--remove-source-files",
+                     "--rsync-path=/usr/bin/rsync",
+                     merged_danmaku_path, f"{nas_host}:{nas_dest_dir}/{nas_danmaku_name}"],
+                    capture_output=True,
+                    text=True,
+                )
+                if danmaku_rsync.returncode != 0:
+                    self.log(logging.WARNING, "Danmaku rsync failed (rc=%d): %s",
+                             danmaku_rsync.returncode, danmaku_rsync.stderr[-200:])
+                else:
+                    self.log(logging.INFO, "Danmaku uploaded: %s", nas_danmaku_name)
+
             self._notify({
                 "msg_type": "text",
                 "event": "nas_sync_done",
@@ -525,6 +587,18 @@ class StreamerMonitor:
                     pass  # already removed (e.g. single-file rsync --remove-source-files)
                 except Exception as e:
                     self.log(logging.WARNING, "Failed to delete %s: %s", f, e)
+
+            # Clean up individual danmaku segment files (merged file already removed by rsync)
+            if merged_danmaku_path and len(valid_files) > 1:
+                for f in valid_files:
+                    danmaku_seg = os.path.splitext(f)[0] + ".danmaku.jsonl"
+                    if os.path.exists(danmaku_seg) and danmaku_seg != merged_danmaku_path:
+                        try:
+                            os.remove(danmaku_seg)
+                            self.log(logging.INFO, "Deleted danmaku segment: %s", os.path.basename(danmaku_seg))
+                        except Exception as e:
+                            self.log(logging.WARNING, "Failed to delete danmaku segment %s: %s",
+                                     os.path.basename(danmaku_seg), e)
 
             self.log(logging.INFO, "Post-processing complete.")
 
@@ -642,14 +716,15 @@ class StreamerMonitor:
         if self._current_recording is not None:
             rec = self._current_recording
             rec_path = rec.get("path", "")
-            rec_ts = rec.get("rec_start_ts")
             if rec_path and os.path.exists(rec_path):
                 self.log(logging.INFO, "Recovering interrupted recording: %s", os.path.basename(rec_path))
-                if self.config.get("timestamp_watermark", False) and rec_ts is not None:
-                    self.log(logging.INFO, "Applying watermark to recovered file...")
-                    self._add_watermark(rec_path, rec_ts)
                 if rec_path not in self._session_files:
                     self._session_files.append(rec_path)
+                if self.config.get("danmaku_enabled", False):
+                    danmaku_path = os.path.splitext(rec_path)[0] + ".danmaku.jsonl"
+                    self.log(logging.INFO, "Resuming danmaku capture → %s", os.path.basename(danmaku_path))
+                    self._danmaku_recorder = DanmakuRecorder(self.url, danmaku_path, self.config, self.label)
+                    self._danmaku_recorder.start()
             else:
                 self.log(logging.WARNING, "Interrupted recording not found on disk (skipping): %s", rec_path)
             self._current_recording = None
@@ -775,6 +850,10 @@ class StreamerMonitor:
             self._ff_proc = None
             self._sl_pgid = None
             self._ff_pgid = None
+
+            if self._danmaku_recorder is not None:
+                self._danmaku_recorder.stop()
+                self._danmaku_recorder = None
 
             if _shutdown_event.is_set():
                 break
