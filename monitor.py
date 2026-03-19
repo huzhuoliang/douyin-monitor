@@ -134,6 +134,10 @@ class StreamerMonitor:
         self._phase_since: float = time.time()
         self._phase_detail: str | None = None
         self._next_poll_at: float | None = None
+        # Postproc thread phase — separate from poll thread's _phase
+        self._postproc_phase: str | None = None
+        self._postproc_phase_since: float = 0.0
+        self._postproc_detail: str | None = None
 
     def log(self, level: int, msg: str, *args) -> None:
         logging.log(level, f"[{self.label}] " + msg, *args)
@@ -412,12 +416,12 @@ class StreamerMonitor:
                     if start_ts is None:
                         self.log(logging.WARNING, "Cannot parse timestamp from filename, skipping watermark: %s", os.path.basename(f))
                         continue
-                    self._set_phase("WATERMARKING", os.path.basename(f))
+                    self._set_postproc_phase("WATERMARKING", os.path.basename(f))
                     self.log(logging.INFO, "Adding timestamp watermark: %s", os.path.basename(f))
                     quality = self._segment_quality.get(f)
                     self._add_watermark(f, start_ts, quality=quality)
 
-            self._set_phase("VALIDATING", f"{len(files)} file(s)")
+            self._set_postproc_phase("VALIDATING", f"{len(files)} file(s)")
 
             # Step 1: Validate
             if _shutdown_event.is_set():
@@ -471,7 +475,7 @@ class StreamerMonitor:
                     for vf in valid_files:
                         f.write(f"file '{vf}'\n")
 
-                self._set_phase("MERGING", merged_name)
+                self._set_postproc_phase("MERGING", merged_name)
                 self.log(logging.INFO, "Merging into %s", merged_name)
                 ffmpeg_path = self.config["ffmpeg_path"]
                 merge_result = subprocess.run(
@@ -530,7 +534,7 @@ class StreamerMonitor:
             month_str = first_timestamp[:4] + "-" + first_timestamp[4:6]  # YYYYMMDD_... → YYYY-MM
             nas_dest_dir = f"{nas_base_dir}/{self.label}/{month_str}"
 
-            self._set_phase("UPLOADING", f"{nas_host}:{nas_dest_dir}/")
+            self._set_postproc_phase("UPLOADING", f"{nas_host}:{nas_dest_dir}/")
             self.log(logging.INFO, "Uploading to %s:%s/", nas_host, nas_dest_dir)
 
             mkdir_result = subprocess.run(
@@ -599,7 +603,7 @@ class StreamerMonitor:
                 self.log(logging.WARNING, "Shutdown detected, skipping local cleanup (files preserved)")
                 return
 
-            self._set_phase("CLEANING")
+            self._set_postproc_phase("CLEANING")
             self.log(logging.INFO, "Upload done. Cleaning up %d local segment(s)...", len(files))
             for f in files:
                 try:
@@ -626,7 +630,7 @@ class StreamerMonitor:
 
         finally:
             self._post_processing = False
-            self._set_phase("IDLE")
+            self._set_postproc_phase(None)  # clear postproc phase; poll thread owns IDLE
 
     @property
     def _state_path(self) -> str:
@@ -692,11 +696,19 @@ class StreamerMonitor:
             self.log(logging.WARNING, "Feishu webhook error: %s", e)
 
     def _set_phase(self, phase: str, detail: str | None = None) -> None:
-        """Update current phase and persist to status file."""
+        """Update poll-thread phase and persist to status file."""
         if phase != self._phase:
             self._phase_since = time.time()
         self._phase = phase
         self._phase_detail = detail
+        self._write_status()
+
+    def _set_postproc_phase(self, phase: str | None, detail: str | None = None) -> None:
+        """Update postproc-thread phase and persist to status file. Pass None to clear."""
+        if phase != self._postproc_phase:
+            self._postproc_phase_since = time.time()
+        self._postproc_phase = phase
+        self._postproc_detail = detail
         self._write_status()
 
     def _write_status(self) -> None:
@@ -713,6 +725,9 @@ class StreamerMonitor:
             "next_poll_at": self._next_poll_at,
             "post_process_delay": self.config.get("post_process_delay", 1800),
             "session_files_count": len(self._session_files),
+            "postproc_phase": self._postproc_phase,
+            "postproc_phase_since": self._postproc_phase_since if self._postproc_phase else None,
+            "postproc_detail": self._postproc_detail,
             "updated_at": time.time(),
         }
         safe = sanitize_filename(self.label)
@@ -806,9 +821,7 @@ class StreamerMonitor:
                     t.start()
 
                 self._next_poll_at = time.time() + interval
-                if self._post_processing:
-                    self._write_status()  # update next_poll_at without overwriting postproc phase
-                elif self._session_files:
+                if self._session_files:
                     self._set_phase("WAITING", f"{len(self._session_files)} file(s) pending")
                 else:
                     self._set_phase("IDLE")

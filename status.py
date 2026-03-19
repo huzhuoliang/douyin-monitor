@@ -56,6 +56,15 @@ PHASE_COLOR = {
     "UPLOADING":   "\033[94m",   # blue
     "CLEANING":    "\033[94m",   # blue
 }
+
+POSTPROC_NEXT = {
+    "WATERMARKING": "→ VALIDATING",
+    "VALIDATING":   "→ MERGING / UPLOAD",
+    "MERGING":      "→ UPLOADING",
+    "TRANSCRIBING": "→ UPLOADING",
+    "UPLOADING":    "→ CLEANING → done",
+    "CLEANING":     "→ done",
+}
 RESET = "\033[0m"
 DIM   = "\033[2m"
 BOLD  = "\033[1m"
@@ -190,8 +199,25 @@ def main():
             "detail":   compute_detail(s),
             "next":     compute_next(s),
             "stale":    stale,
+            "is_sub":   False,
             "_raw":     s,
         })
+
+        # Postproc sub-row: shown when postproc thread is running in parallel
+        pp_phase = s.get("postproc_phase")
+        if pp_phase:
+            pp_since = s.get("postproc_phase_since")
+            rows.append({
+                "label":    "  └─",
+                "phase":    pp_phase,
+                "since":    fmt_time(pp_since),
+                "duration": fmt_duration(now - pp_since) if pp_since else "-",
+                "detail":   s.get("postproc_detail") or "-",
+                "next":     POSTPROC_NEXT.get(pp_phase, "-"),
+                "stale":    False,
+                "is_sub":   True,
+                "_raw":     s,
+            })
 
     # Column widths (in display chars)
     col = {
@@ -237,12 +263,18 @@ def main():
 
         if r.get("stale") and use_color:
             line = DIM + line + RESET
+        elif r.get("is_sub") and use_color:
+            # Sub-row: dim label and metadata, keep phase color
+            line = (DIM + label_str + reset
+                    + color + phase_str + reset
+                    + DIM + since_str + duration_str + detail_str + next_str + reset)
 
         print(line)
 
     print(sep)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"  {now_str}  |  {len(rows)} streamer(s)  |  output: {output_dir}\n")
+    n_streamers = sum(1 for r in rows if not r.get("is_sub"))
+    print(f"  {now_str}  |  {n_streamers} streamer(s)  |  output: {output_dir}\n")
 
 
 if __name__ == "__main__":
