@@ -128,6 +128,8 @@ class StreamerMonitor:
         self._consecutive_offline: int = 0        # persisted across restarts for adaptive polling
         self._current_recording: dict | None = None  # {"path": ..., "rec_start_ts": ...}
         self._danmaku_recorder: DanmakuRecorder | None = None
+        self._quality_index: int = 0             # index into quality_ladder; 0 = best
+        self._segment_quality: dict[str, str] = {}  # path → quality string, for watermarking
         self._phase: str = "STARTING"
         self._phase_since: float = time.time()
         self._phase_detail: str | None = None
@@ -190,10 +192,14 @@ class StreamerMonitor:
     def start_recording(self, output_path: str) -> bool:
         """Start streamlink | ffmpeg pipeline. Returns True on success."""
         streamlink_path = self.config["streamlink_path"]
-        quality = self.config.get("streamlink_quality", "best")
+        if self.config.get("adaptive_quality", True):
+            ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
+            quality = ladder[min(self._quality_index, len(ladder) - 1)]
+        else:
+            quality = self.config.get("streamlink_quality", "best")
         ffmpeg_path = self.config["ffmpeg_path"]
 
-        self.log(logging.INFO, "Starting recording: %s", output_path)
+        self.log(logging.INFO, "Starting recording [quality=%s]: %s", quality, output_path)
         try:
             sl_proc = subprocess.Popen(
                 [streamlink_path, "--stdout", self.url, quality],
@@ -213,7 +219,7 @@ class StreamerMonitor:
             self._sl_pgid = os.getpgid(sl_proc.pid)
             self._ff_pgid = os.getpgid(ff_proc.pid)
             self._rec_start_ts = int(time.time())
-            self._current_recording = {"path": output_path, "rec_start_ts": self._rec_start_ts}
+            self._current_recording = {"path": output_path, "rec_start_ts": self._rec_start_ts, "quality": quality}
             self._save_state()
 
             if self.config.get("danmaku_enabled", False):
@@ -229,17 +235,32 @@ class StreamerMonitor:
             self.log(logging.ERROR, "Failed to start recording: %s", e)
             return False
 
-    def _add_watermark(self, input_path: str, start_ts: int) -> bool:
-        """Re-encode input_path in-place with a timestamp watermark. Returns True on success."""
+    # Quality label → display name (Chinese)
+    _QUALITY_LABELS: dict[str, str] = {
+        "best": "超清", "hd": "高清", "1080p": "超清",
+        "720p": "高清", "sd": "标清", "480p": "标清",
+        "360p": "流畅", "ld": "流畅", "md": "流畅",
+        "worst": "流畅", "ao": "仅音频",
+    }
+
+    def _add_watermark(self, input_path: str, start_ts: int, quality: str | None = None) -> bool:
+        """Re-encode input_path in-place with a timestamp (and optional quality) watermark."""
+        # Default to a CJK-capable font so Chinese quality labels render correctly
         font = self.config.get(
             "watermark_font",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         )
         size = self.config.get("watermark_fontsize", 24)
         threads = self.config.get("watermark_threads", 1)
+        # Quality label
+        if quality:
+            label = self._QUALITY_LABELS.get(quality.lower(), quality.upper())
+            text = f"{label}  %Y-%m-%d %H\\:%M\\:%S"
+        else:
+            text = "%Y-%m-%d %H\\:%M\\:%S"
         drawtext = (
             f"drawtext=fontfile={font}:"
-            f"text='%Y-%m-%d %H\\:%M\\:%S':"
+            f"text='{text}':"
             f"basetime={start_ts * 1000000}:expansion=strftime:"
             f"x=w-text_w-10:y=h-text_h-10:"
             f"fontsize={size}:fontcolor=white:"
@@ -393,7 +414,8 @@ class StreamerMonitor:
                         continue
                     self._set_phase("WATERMARKING", os.path.basename(f))
                     self.log(logging.INFO, "Adding timestamp watermark: %s", os.path.basename(f))
-                    self._add_watermark(f, start_ts)
+                    quality = self._segment_quality.get(f)
+                    self._add_watermark(f, start_ts, quality=quality)
 
             self._set_phase("VALIDATING", f"{len(files)} file(s)")
 
@@ -618,6 +640,8 @@ class StreamerMonitor:
             "offline_since": self._offline_since,
             "session_files": self._session_files,
             "current_recording": self._current_recording,
+            "quality_index": self._quality_index,
+            "segment_quality": self._segment_quality,
         }
         tmp = self._state_path + ".tmp"
         try:
@@ -639,9 +663,11 @@ class StreamerMonitor:
             self._offline_since = state.get("offline_since")
             self._session_files = state.get("session_files") or []
             self._current_recording = state.get("current_recording")
+            self._quality_index = int(state.get("quality_index", 0))
+            self._segment_quality = state.get("segment_quality") or {}
             self.log(logging.INFO,
-                "Restored state: consecutive_offline=%d, session_files=%d",
-                self._consecutive_offline, len(self._session_files),
+                "Restored state: consecutive_offline=%d, session_files=%d, quality_index=%d",
+                self._consecutive_offline, len(self._session_files), self._quality_index,
             )
         except Exception as e:
             self.log(logging.WARNING, "Failed to load state (ignoring): %s", e)
@@ -858,12 +884,33 @@ class StreamerMonitor:
             if _shutdown_event.is_set():
                 break
 
+            # Adaptive quality: capture quality and duration before clearing state
+            rec_quality = (self._current_recording or {}).get("quality", "best")
+            rec_duration = int(time.time()) - (self._rec_start_ts or int(time.time()))
+
             if returncode not in (0, None):
-                self.log(logging.WARNING, "ffmpeg exited with code %d", returncode)
+                self.log(logging.WARNING, "ffmpeg exited with code %d (duration=%ds)", returncode, rec_duration)
+                # Downgrade quality on short error exit (likely network issue)
+                if self.config.get("adaptive_quality", True):
+                    ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
+                    downgrade_thresh = self.config.get("quality_downgrade_threshold", 60)
+                    if rec_duration < downgrade_thresh and self._quality_index < len(ladder) - 1:
+                        self._quality_index += 1
+                        self.log(logging.WARNING, "Downgrading quality → %s (short recording)",
+                                 ladder[min(self._quality_index, len(ladder) - 1)])
                 self._set_phase("IDLE")
             else:
                 self.log(logging.INFO, "Recording finished: %s", output_path)
+                self._segment_quality[output_path] = rec_quality
                 self._session_files.append(output_path)
+                # Upgrade quality after a long stable recording
+                if self.config.get("adaptive_quality", True):
+                    ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
+                    upgrade_thresh = self.config.get("quality_upgrade_threshold", 300)
+                    if rec_duration >= upgrade_thresh and self._quality_index > 0:
+                        self._quality_index -= 1
+                        self.log(logging.INFO, "Upgrading quality → %s (stable recording %ds)",
+                                 ladder[self._quality_index], rec_duration)
                 _ended_at = int(time.time())
                 self._notify({
                     "msg_type": "text",

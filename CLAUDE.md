@@ -82,13 +82,15 @@ Signal flow:
 ### Post-processing flow (per session)
 
 ```
-recording ends → _session_files.append(path) → poll loop continues immediately
+recording ends → _session_files.append(path) → _segment_quality[path]=quality → poll loop continues immediately
 ↓
 each offline poll: check (time.time() - offline_since) >= post_process_delay
 ↓  (threshold reached, session_files non-empty, not already processing)
 _post_process_session() started in daemon thread "{label}-postproc"
   Step 0: ffmpeg drawtext re-encode each segment in-place (if timestamp_watermark=true)
            start_ts parsed from filename (YYYYMMDD_HHMMSS), -threads watermark_threads
+           quality label from _segment_quality[path] → "超清/高清/标清/流畅" prepended to timestamp text
+           fontcolor=white; font=NotoSansCJK-Regular.ttc (supports Chinese)
   Step 1: ffprobe validate each segment → valid_files list
   Step 2: ffmpeg -f concat → 抖音_{label}_{ts}_merged.mp4  (skip if 1 file)
            NAS upload renames to 抖音_{label}_{ts}.mp4 (strips _merged; local file kept as-is to avoid conflict with original segments)
@@ -239,6 +241,24 @@ python3 monitor.py --config config.json
 | `nas_host` | `"nas"` | SSH alias in `~/.ssh/config`; must be passwordless |
 | `nas_dest_dir` | `"/volume1/Share/LiveVideos"` | rsync destination path on NAS |
 | `post_process_delay` | `1800` | Seconds offline before triggering post-process |
+
+### Adaptive quality config fields
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `adaptive_quality` | `true` | Master switch; `false` → fixed `streamlink_quality` |
+| `streamlink_quality_ladder` | `["best","720p","480p","worst"]` | Quality tiers; index 0 = best |
+| `quality_downgrade_threshold` | `60` | Seconds; error exit + duration < this → downgrade |
+| `quality_upgrade_threshold` | `300` | Seconds; clean exit + duration ≥ this → upgrade |
+
+**Adaptive quality state** (persisted in `.douyin_state_{label}.json`):
+- `quality_index`: current position in ladder (0 = best); survives restart
+- `segment_quality`: `{path: quality_string}` map; used by `_add_watermark()` to label each segment
+
+**Quality label mapping** (class-level `_QUALITY_LABELS` dict):
+- `best/hd/1080p/720p` → 超清/高清 ; `sd/480p/md/360p` → 标清/流畅 ; `ld/worst` → 流畅
+- Font changed to `NotoSansCJK-Regular.ttc` (default) to support Chinese glyphs
+- `watermark_font` in config overrides the font path
 
 ### Feishu webhook config fields
 
