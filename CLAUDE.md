@@ -82,20 +82,22 @@ Signal flow:
 ### Post-processing flow (per session)
 
 ```
-recording ends → _session_files.append(path) → _segment_quality[path]=quality → poll loop continues immediately
+recording ends → _session_files.append(path.ts) → _segment_quality[path]=quality → poll loop continues immediately
 ↓
 each offline poll: check (time.time() - offline_since) >= post_process_delay
 ↓  (threshold reached, session_files non-empty, not already processing)
 _post_process_session() started in daemon thread "{label}-postproc"
-  Step 0: ffmpeg drawtext re-encode each segment in-place (if timestamp_watermark=true)
+  Step 0: ffmpeg -i seg.ts -c copy seg.mp4  (CONVERTING; converts each .ts → .mp4)
+           .ts deleted after successful conversion; _segment_quality keys migrated .ts→.mp4
+  Step 1: ffmpeg drawtext re-encode each .mp4 in-place (if timestamp_watermark=true) [WATERMARKING]
            start_ts parsed from filename (YYYYMMDD_HHMMSS), -threads watermark_threads
            quality label from _segment_quality[path] → "超清/高清/标清/流畅" prepended to timestamp text
            fontcolor=white; font=NotoSansCJK-Regular.ttc (supports Chinese)
-  Step 1: ffprobe validate each segment → valid_files list
-  Step 2: ffmpeg -f concat → 抖音_{label}_{ts}_merged.mp4  (skip if 1 file)
+  Step 2: ffprobe validate each .mp4 → valid_files list [VALIDATING]
+  Step 3: ffmpeg -f concat → 抖音_{label}_{ts}_merged.mp4  (skip if 1 file) [MERGING]
            NAS upload renames to 抖音_{label}_{ts}.mp4 (strips _merged; local file kept as-is to avoid conflict with original segments)
-  Step 3: ssh nas mkdir -p; rsync -av --remove-source-files merged → NAS
-  Step 4: os.remove() each original segment
+  Step 4: ssh nas mkdir -p; rsync -av --remove-source-files merged → NAS [UPLOADING]
+  Step 5: os.remove() each original segment [CLEANING]
   Shutdown check at start of every step; files preserved on abort
 ```
 
@@ -112,7 +114,9 @@ _post_process_session() started in daemon thread "{label}-postproc"
 ## Key Design Decisions
 
 ### Dual-process recording pipeline
-`streamlink --stdout` pipes the raw stream into `ffmpeg -i pipe:0`. Each process gets its own setsid process group. On shutdown, both pgids receive SIGTERM independently.
+`streamlink --stdout` pipes the raw stream into `ffmpeg -i pipe:0 -f mpegts`. Each process gets its own setsid process group. On shutdown, both pgids receive SIGTERM independently.
+
+Recording uses **MPEG-TS** (`.ts`) format to avoid H.264 花屏 corruption. The root cause: when recording to MP4 via pipe with `-c copy`, ffmpeg writes the initial SPS/PPS into the `avcC` atom once; if the Douyin CDN reconnects mid-stream and the new HLS segment carries different SPS/PPS inline, players decode against the stale `avcC` and produce garbled video while audio remains normal. MPEG-TS uses Annex B format where each keyframe carries inline SPS/PPS — no `avcC` atom, no stale header issue. The `.ts` → `.mp4` conversion in post-processing (from a complete file, not a pipe) correctly builds the `avcC` from the full bitstream.
 
 ### Single network call per poll cycle
 `check_live_info()` runs one `streamlink --json` call and returns `(is_live, uploader_name)` together — avoids a second request to get the author name.
@@ -130,7 +134,8 @@ _post_process_session() started in daemon thread "{label}-postproc"
 `interruptible_sleep()` uses `_shutdown_event.wait(timeout)` — responds immediately when event is set, no polling overhead.
 
 ### Filename format
-`抖音_{sanitized_uploader}_{YYYYMMDD_HHMMSS}.mp4`
+Recording: `抖音_{sanitized_uploader}_{YYYYMMDD_HHMMSS}.ts` (raw MPEG-TS)
+After post-processing conversion: `抖音_{sanitized_uploader}_{YYYYMMDD_HHMMSS}.mp4`
 - `sanitize_filename()` strips `\ / : * ? " < > |`, collapses whitespace, preserves Chinese characters
 - Uploader name sourced from `streamlink --json` → `metadata.author`
 - Fallback: extracts `@username` or room ID from URL path
@@ -157,7 +162,7 @@ After=network-online.target
 
 ```bash
 streamlink --stdout {url} best \
-  | ffmpeg -i pipe:0 -c copy -y {output_path}
+  | ffmpeg -i pipe:0 -c copy -f mpegts -y {output_path.ts}
 ```
 
 Live status check:
@@ -197,10 +202,11 @@ IDLE → CONNECTING → RECORDING
                      WAITING
                         │ (post_process_delay elapsed)
                         ↓
-               WATERMARKING* → VALIDATING → MERGING** → UPLOADING → CLEANING → IDLE
+               CONVERTING → WATERMARKING* → VALIDATING → MERGING** → UPLOADING → CLEANING → IDLE
 
 * WATERMARKING: only when timestamp_watermark=true (runs in postproc thread, not poll loop)
 ** MERGING: only when multiple segments
+CONVERTING: .ts → .mp4 (always; fixes H.264 SPS/PPS avcC corruption issue)
 ```
 
 **Status JSON files** (written atomically by `_write_status()`):

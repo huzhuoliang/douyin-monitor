@@ -48,6 +48,7 @@ PHASE_COLOR = {
     "IDLE":        "\033[90m",   # gray
     "CONNECTING":  "\033[96m",   # cyan
     "RECORDING":   "\033[92m",   # bright green
+    "CONVERTING":  "\033[94m",   # blue
     "WATERMARKING":"\033[93m",   # yellow
     "WAITING":     "\033[93m",   # yellow
     "VALIDATING":  "\033[94m",   # blue
@@ -58,6 +59,7 @@ PHASE_COLOR = {
 }
 
 POSTPROC_NEXT = {
+    "CONVERTING":   "→ WATERMARKING / VALIDATING",
     "WATERMARKING": "→ VALIDATING",
     "VALIDATING":   "→ MERGING / UPLOAD",
     "MERGING":      "→ UPLOADING",

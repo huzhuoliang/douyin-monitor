@@ -211,7 +211,7 @@ class StreamerMonitor:
                 preexec_fn=os.setsid,
             )
             ff_proc = subprocess.Popen(
-                [ffmpeg_path, "-i", "pipe:0", "-c", "copy", "-y", output_path],
+                [ffmpeg_path, "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-y", output_path],
                 stdin=sl_proc.stdout,
                 preexec_fn=os.setsid,
             )
@@ -405,8 +405,45 @@ class StreamerMonitor:
         """Validate → merge → upload to NAS → clean local segments. Runs in a daemon thread."""
         try:
             self.log(logging.INFO, "Post-processing %d session file(s)...", len(files))
+            ffmpeg_path = self.config["ffmpeg_path"]
 
-            # Step 0: Watermark each segment
+            # Step 0: Convert .ts → .mp4
+            # Recording uses MPEG-TS to avoid H.264 SPS/PPS discontinuity corruption.
+            # Convert to MP4 now (from a complete file, not a pipe) so ffmpeg can build
+            # a correct avcC atom from the full bitstream.
+            if any(f.endswith(".ts") for f in files):
+                if _shutdown_event.is_set():
+                    self.log(logging.WARNING, "Shutdown detected, aborting post-processing (before convert)")
+                    return
+                converted = []
+                for f in files:
+                    if not f.endswith(".ts"):
+                        converted.append(f)
+                        continue
+                    mp4_path = f[:-3] + ".mp4"
+                    self._set_postproc_phase("CONVERTING", os.path.basename(f))
+                    self.log(logging.INFO, "Converting TS→MP4: %s", os.path.basename(f))
+                    conv_result = subprocess.run(
+                        [ffmpeg_path, "-i", f, "-c", "copy", "-y", mp4_path],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if conv_result.returncode != 0:
+                        self.log(logging.ERROR, "TS→MP4 conversion failed (rc=%d): %s",
+                                 conv_result.returncode, conv_result.stderr[-300:])
+                        converted.append(f)  # keep .ts; validation will handle it
+                    else:
+                        try:
+                            os.remove(f)
+                        except Exception:
+                            pass
+                        # Migrate quality map key .ts → .mp4
+                        if f in self._segment_quality:
+                            self._segment_quality[mp4_path] = self._segment_quality.pop(f)
+                        converted.append(mp4_path)
+                files = converted
+
+            # Step 2: Watermark each segment
             if self.config.get("timestamp_watermark", False):
                 if _shutdown_event.is_set():
                     self.log(logging.WARNING, "Shutdown detected, aborting post-processing (before watermark)")
@@ -423,7 +460,7 @@ class StreamerMonitor:
 
             self._set_postproc_phase("VALIDATING", f"{len(files)} file(s)")
 
-            # Step 1: Validate
+            # Step 3: Validate
             if _shutdown_event.is_set():
                 self.log(logging.WARNING, "Shutdown detected, aborting post-processing (before validate)")
                 return
@@ -451,7 +488,7 @@ class StreamerMonitor:
                 self.log(logging.ERROR, "No valid files to process, aborting")
                 return
 
-            # Step 2: Merge (or pass through single file)
+            # Step 4: Merge (or pass through single file)
             if _shutdown_event.is_set():
                 self.log(logging.WARNING, "Shutdown detected, aborting post-processing (before merge)")
                 return
@@ -477,7 +514,6 @@ class StreamerMonitor:
 
                 self._set_postproc_phase("MERGING", merged_name)
                 self.log(logging.INFO, "Merging into %s", merged_name)
-                ffmpeg_path = self.config["ffmpeg_path"]
                 merge_result = subprocess.run(
                     [ffmpeg_path, "-f", "concat", "-safe", "0", "-i", concat_file,
                      "-c", "copy", "-y", merged_path],
@@ -834,7 +870,7 @@ class StreamerMonitor:
             self._save_state()
             name = uploader or self.label
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"抖音_{name}_{timestamp}.mp4"
+            filename = f"抖音_{name}_{timestamp}.ts"
             output_path = str(output_dir / filename)
 
             self._next_poll_at = None
