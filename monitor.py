@@ -868,9 +868,8 @@ class StreamerMonitor:
             self._consecutive_offline = 0
             self._offline_since = None  # reset offline timer; keep _session_files for this session
             self._save_state()
-            name = uploader or self.label
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"抖音_{name}_{timestamp}.ts"
+            filename = f"抖音_{self.label}_{timestamp}.ts"
             output_path = str(output_dir / filename)
 
             self._next_poll_at = None
@@ -887,7 +886,7 @@ class StreamerMonitor:
                 "event": "stream_live",
                 "label": self.label,
                 "url": self.url,
-                "uploader": name,
+                "uploader": uploader or self.label,
                 "started_at_str": datetime.fromtimestamp(self._rec_start_ts).strftime("%Y-%m-%d %H:%M:%S"),
                 "output_path": output_path,
             })

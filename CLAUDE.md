@@ -134,11 +134,12 @@ Recording uses **MPEG-TS** (`.ts`) format to avoid H.264 花屏 corruption. The 
 `interruptible_sleep()` uses `_shutdown_event.wait(timeout)` — responds immediately when event is set, no polling overhead.
 
 ### Filename format
-Recording: `抖音_{sanitized_uploader}_{YYYYMMDD_HHMMSS}.ts` (raw MPEG-TS)
-After post-processing conversion: `抖音_{sanitized_uploader}_{YYYYMMDD_HHMMSS}.mp4`
+Recording: `抖音_{label}_{YYYYMMDD_HHMMSS}.ts` (raw MPEG-TS)
+After post-processing conversion: `抖音_{label}_{YYYYMMDD_HHMMSS}.mp4`
+- `label` = configured name from `config.json` (`streamers[].name`) — **not** the streamer's live display name
+- Using the configured label ensures filenames stay stable even if the streamer renames themselves
 - `sanitize_filename()` strips `\ / : * ? " < > |`, collapses whitespace, preserves Chinese characters
-- Uploader name sourced from `streamlink --json` → `metadata.author`
-- Fallback: extracts `@username` or room ID from URL path
+- `uploader` (from `streamlink --json` → `metadata.author`) is still sent in Feishu notifications but not used for filenames
 
 ### Cookie auth
 `cookies_from_browser` in config.json (e.g. `"chrome"`). Currently unused by streamlink backend — kept for future use. Set `null`.
