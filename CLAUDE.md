@@ -291,20 +291,37 @@ python3 monitor.py --config config.json
 - Font changed to `NotoSansCJK-Regular.ttc` (default) to support Chinese glyphs
 - `watermark_font` in config overrides the font path
 
-### Feishu webhook config fields
-
-| Field | Default | Notes |
-|-------|---------|-------|
-| `feishu_webhook_url` | `null` | Feishu Flow webhook trigger URL; `null` disables all notifications |
+### Notification config fields
 
 Three events are sent via `_notify()` (stdlib `urllib.request`, 10s timeout, non-fatal):
 - `stream_live` — after `start_recording()` succeeds
 - `stream_ended` — after ffmpeg exits cleanly, before `_rec_start_ts = None`
 - `nas_sync_done` — after rsync succeeds, before Step 4 local cleanup
 
+#### Feishu
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `feishu_enabled` | `true` | Master switch; `false` skips Feishu even if URL is set |
+| `feishu_webhook_url` | `null` | Feishu Flow webhook trigger URL; `null` disables Feishu |
+
 Payload is **flat JSON** with `msg_type: "text"` (required by Feishu Flow webhook trigger).
 Each event sends a different subset of fields; see README for per-event field list.
 Feishu Flow webhook trigger "参数示例" should be the merged superset of all fields (see README).
+
+#### Telegram
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `telegram_enabled` | `true` | Master switch; `false` skips Telegram even if URL is set |
+| `telegram_notify_url` | `null` | Local telegram_monitor HTTP server URL (e.g. `http://127.0.0.1:8765`); `null` disables Telegram |
+
+Messages sent as **HTML** via `/send` endpoint with `parse_mode: "HTML"`. Three message formats:
+- `stream_live` → `🔴 <b>{label}</b> 开播了 + 时间`
+- `stream_ended` → `⏹ <b>{label}</b> 下播了 + 时长 + 文件名 + 大小`
+- `nas_sync_done` → `✅ <b>{label}</b> NAS 上传完成 + 文件名`
+
+Requires [telegram_monitor](../telegram_monitor) service (`telegram_bot.service`) to be running.
 
 ### Transcription & outline config fields
 

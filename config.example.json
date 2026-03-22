@@ -32,7 +32,10 @@
   "whisper_language": "zh",
   "generate_outline": false,
   "outline_model": "claude-haiku-4-5-20251001",
+  "feishu_enabled": true,
   "feishu_webhook_url": null,
+  "telegram_enabled": true,
+  "telegram_notify_url": null,
   "danmaku_enabled": false,
   "danmaku_cookies": null
 }

@@ -738,23 +738,74 @@ class StreamerMonitor:
             self.log(logging.WARNING, "Failed to load state (ignoring): %s", e)
 
     def _notify(self, payload: dict) -> None:
-        """POST JSON to Feishu webhook. Non-fatal."""
-        url = self.config.get("feishu_webhook_url")
-        if not url:
+        """POST to Feishu webhook and/or Telegram bot. Non-fatal."""
+        import urllib.request
+        feishu_url = self.config.get("feishu_webhook_url")
+        if feishu_url and self.config.get("feishu_enabled", True):
+            try:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(
+                    feishu_url, data=body,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status != 200:
+                        self.log(logging.WARNING, "Feishu webhook HTTP %d", resp.status)
+            except Exception as e:
+                self.log(logging.WARNING, "Feishu webhook error: %s", e)
+        self._notify_telegram(payload)
+
+    @staticmethod
+    def _fmt_duration(seconds: int) -> str:
+        h, m = divmod(int(seconds), 3600)
+        m, s = divmod(m, 60)
+        if h:
+            return f"{h}h{m:02d}m"
+        return f"{m}m{s:02d}s"
+
+    def _notify_telegram(self, payload: dict) -> None:
+        """Send HTML-formatted notification to local telegram_monitor service. Non-fatal."""
+        import urllib.request
+        tg_url = self.config.get("telegram_notify_url")
+        if not tg_url or not self.config.get("telegram_enabled", True):
             return
-        import urllib.request, urllib.error
+        event = payload.get("event", "")
+        label = payload.get("label", self.label)
+        if event == "stream_live":
+            text = (
+                f"🔴 <b>{label}</b> 开播了\n\n"
+                f"⏰ {payload.get('started_at_str', '')}"
+            )
+        elif event == "stream_ended":
+            duration = self._fmt_duration(payload.get("duration_seconds", 0))
+            size_mb = payload.get("file_size_mb", 0)
+            filename = payload.get("filename", "")
+            text = (
+                f"⏹ <b>{label}</b> 下播了\n\n"
+                f"⏱ 时长：{duration}\n"
+                f"📁 <code>{filename}</code>\n"
+                f"💾 {size_mb} MB"
+            )
+        elif event == "nas_sync_done":
+            text = (
+                f"✅ <b>{label}</b> NAS 上传完成\n\n"
+                f"📂 <code>{payload.get('merged_filename', '')}</code>"
+            )
+        else:
+            return
         try:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = json.dumps({"text": text, "parse_mode": "HTML"}, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(
-                url, data=body,
+                f"{tg_url.rstrip('/')}/send", data=body,
                 headers={"Content-Type": "application/json; charset=utf-8"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status != 200:
-                    self.log(logging.WARNING, "Feishu webhook HTTP %d", resp.status)
+                    self.log(logging.WARNING, "Telegram notify HTTP %d", resp.status)
         except Exception as e:
-            self.log(logging.WARNING, "Feishu webhook error: %s", e)
+            self.log(logging.WARNING, "Telegram notify error: %s", e)
 
     def _set_phase(self, phase: str, detail: str | None = None) -> None:
         """Update poll-thread phase and persist to status file."""
