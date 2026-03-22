@@ -354,22 +354,27 @@ Fields saved:
 |-------|---------|
 | `consecutive_offline` | Adaptive polling counter — survives restart without resetting to 60s |
 | `offline_since` | Wall time of offline transition — post-process delay continues counting |
-| `session_files` | List of recorded segments — not lost if service restarts between segments |
+| `session_files` | List of recorded segments accumulating this session |
+| `postproc_files` | Files handed to the active postproc thread — set at trigger time, cleared in `finally`; non-empty on restart → auto-retry |
 | `current_recording` | `{path, rec_start_ts}` of the active recording — recovered into `_session_files` on restart |
 
 **Write path**: every meaningful state change calls `_save_state()` which writes to `{path}.tmp` then `os.replace()` (atomic). No partially-written state files.
 
 **Recovery flow** (at `run()` startup):
-1. `_load_state()` restores all four fields
+1. `_load_state()` restores all five fields
 2. If `current_recording` is non-None → interrupted recording detected:
    - File exists on disk → add to `_session_files` (watermark 统一在 `_post_process_session` Step 0 执行)
    - File missing → log warning, skip
    - Clear `current_recording`, save state
-3. Main poll loop starts with fully restored state
+3. If `postproc_files` is non-empty → post-processing was interrupted mid-run:
+   - Spawn a new postproc thread immediately with those files
+   - Thread's `finally` block clears `postproc_files` and saves state on completion
+4. Main poll loop starts with fully restored state
 
-**`_save_state()` call sites** in `run()`:
+**`_save_state()` call sites**:
 - Offline branch: after `_consecutive_offline` increment + `_offline_since` set
-- Post-process trigger: after `_session_files = []` and `_offline_since = None`
+- Post-process trigger: after `_session_files = []`, `_postproc_files = [...]`, `_offline_since = None`
+- Post-process `finally`: after `_postproc_files = []` (completion or abort)
 - Live detected: after `_consecutive_offline = 0` and `_offline_since = None`
 - `start_recording()` success: `_current_recording` set
 - Recording ends: `_current_recording = None`, `_session_files.append()`
@@ -385,29 +390,23 @@ Fields saved:
 - streamlink breaks occasionally with Douyin; run `sudo pip3 install -U streamlink --break-system-packages` when recording stops working
 - On Ubuntu 24.04 (Python 3.12), pip install requires `--break-system-packages` due to PEP 668 externally-managed-environment restriction
 - Each `StreamerMonitor` instance owns its own `_sl_proc/_ff_proc/_sl_pgid/_ff_pgid` — no shared mutable state between monitors
-- `_session_files` / `_offline_since` / `_post_processing` are owned by the monitor thread; the postproc thread receives a copy of `files_to_process` and only writes back `_post_processing = False` (GIL guarantees bool assignment atomicity)
+- `_session_files` / `_offline_since` / `_post_processing` are owned by the monitor thread; the postproc thread receives a copy of `files_to_process` and only writes back `_post_processing = False` and `_postproc_files = []` in its `finally` block (GIL guarantees bool/list assignment atomicity)
 - `post_process_delay` uses `time.time()` wall clock, not poll count — immune to adaptive polling interval changes
 - On shutdown during post-processing, files are deliberately preserved (not cleaned up) so nothing is lost
 
 ## Recovery: Post-processing Interrupted by Restart
 
-When the service is restarted mid-post-process, `session_files` is already `[]` in the state file (cleared at trigger time), so the videos will **not** be automatically retried. The MP4 files remain on disk.
+Post-processing interrupted by a restart is **automatically recovered**. The state file tracks in-flight files in `postproc_files`; on startup, if this field is non-empty, `run()` immediately re-spawns the postproc thread before entering the main poll loop. No manual intervention needed.
 
-**Symptom:** `session_files: []` in state file but MP4 still exists locally and was never rsync'd.
-
-**Fix:** patch the state file(s) to re-queue the video and set `offline_since` past the threshold:
+**For files recorded before this fix was deployed** (state file has `postproc_files: []` / missing, but MP4 still on disk and never rsync'd), patch the state file manually:
 
 ```python
 import json, time, os
 
-delay = 1800
-offline_since = time.time() - delay - 10  # already past threshold
-
 path = '/path/to/recordings/.douyin_state_主播A.json'
 with open(path, encoding='utf-8') as f:
     state = json.load(f)
-state['session_files'] = ['/path/to/recordings/抖音_主播A_20260310_211804.mp4']
-state['offline_since'] = offline_since
+state['postproc_files'] = ['/path/to/recordings/抖音_主播A_20260310_211804.mp4']
 state['current_recording'] = None
 tmp = path + '.tmp'
 with open(tmp, 'w', encoding='utf-8') as f:
@@ -415,7 +414,7 @@ with open(tmp, 'w', encoding='utf-8') as f:
 os.replace(tmp, path)
 ```
 
-Then `sudo systemctl restart douyin-monitor` — the monitor will pick it up on the first poll and trigger post-processing immediately.
+Then `sudo systemctl restart douyin-monitor` — postproc thread re-starts immediately.
 
 ## sing-box Proxy Compatibility
 

@@ -123,6 +123,7 @@ class StreamerMonitor:
         self._sl_pgid = None
         self._ff_pgid = None
         self._session_files: list[str] = []       # segments accumulated this session
+        self._postproc_files: list[str] = []      # files handed to the active postproc thread; cleared in finally
         self._offline_since: float | None = None  # wall time of most recent offline transition
         self._post_processing = False             # guard against duplicate trigger
         self._rec_start_ts: int | None = None     # Unix timestamp when current recording started
@@ -686,6 +687,8 @@ class StreamerMonitor:
 
         finally:
             self._post_processing = False
+            self._postproc_files = []   # post-processing done (or aborted); safe to clear
+            self._save_state()
             self._set_postproc_phase(None)  # clear postproc phase; poll thread owns IDLE
 
     @property
@@ -699,6 +702,7 @@ class StreamerMonitor:
             "consecutive_offline": self._consecutive_offline,
             "offline_since": self._offline_since,
             "session_files": self._session_files,
+            "postproc_files": self._postproc_files,
             "current_recording": self._current_recording,
             "quality_index": self._quality_index,
             "segment_quality": self._segment_quality,
@@ -722,12 +726,13 @@ class StreamerMonitor:
             self._consecutive_offline = int(state.get("consecutive_offline", 0))
             self._offline_since = state.get("offline_since")
             self._session_files = state.get("session_files") or []
+            self._postproc_files = state.get("postproc_files") or []
             self._current_recording = state.get("current_recording")
             self._quality_index = int(state.get("quality_index", 0))
             self._segment_quality = state.get("segment_quality") or {}
             self.log(logging.INFO,
-                "Restored state: consecutive_offline=%d, session_files=%d, quality_index=%d",
-                self._consecutive_offline, len(self._session_files), self._quality_index,
+                "Restored state: consecutive_offline=%d, session_files=%d, postproc_files=%d, quality_index=%d",
+                self._consecutive_offline, len(self._session_files), len(self._postproc_files), self._quality_index,
             )
         except Exception as e:
             self.log(logging.WARNING, "Failed to load state (ignoring): %s", e)
@@ -827,6 +832,25 @@ class StreamerMonitor:
             self._current_recording = None
             self._save_state()
 
+        # Recovery: re-trigger post-processing interrupted by a previous restart
+        if self._postproc_files:
+            self.log(
+                logging.INFO,
+                "Recovering interrupted post-processing: %d file(s): %s",
+                len(self._postproc_files),
+                [os.path.basename(f) for f in self._postproc_files],
+            )
+            self._post_processing = True
+            files_to_recover = self._postproc_files[:]
+            # _postproc_files intentionally NOT cleared here; the thread's finally block will clear + save
+            t = threading.Thread(
+                target=self._post_process_session,
+                args=(files_to_recover,),
+                daemon=True,
+                name=f"{self.label}-postproc",
+            )
+            t.start()
+
         self._set_phase("IDLE")
         while not self._should_stop():
             is_live, uploader = self.check_live_info_with_retry()
@@ -866,6 +890,7 @@ class StreamerMonitor:
                     self._post_processing = True
                     files_to_process = self._session_files[:]
                     self._session_files = []
+                    self._postproc_files = files_to_process  # persisted until thread's finally clears it
                     self._offline_since = None
                     self._save_state()
                     t = threading.Thread(
