@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -67,9 +68,20 @@ POSTPROC_NEXT = {
     "UPLOADING":    "→ CLEANING → done",
     "CLEANING":     "→ done",
 }
-RESET = "\033[0m"
-DIM   = "\033[2m"
-BOLD  = "\033[1m"
+RESET   = "\033[0m"
+DIM     = "\033[2m"
+BOLD    = "\033[1m"
+RED_DIM = "\033[2;31m"
+
+
+def _label_from_streamer(s: dict) -> str:
+    if s.get("name"):
+        return s["name"]
+    url = s.get("url", "")
+    m = re.search(r"douyin\.com/(?:@([^/?#]+)|(?:follow/)?live/(\d+)|(\d+))", url)
+    if m:
+        return m.group(1) or m.group(2) or m.group(3)
+    return "unknown"
 
 
 def compute_detail(s: dict) -> str:
@@ -160,6 +172,7 @@ def main():
         sys.exit(1)
 
     output_dir = config.get("output_dir", ".")
+    configured_labels = {_label_from_streamer(s) for s in config.get("streamers", [])}
     status_files = sorted(Path(output_dir).glob(".douyin_status_*.json"))
 
     if not status_files:
@@ -192,9 +205,13 @@ def main():
         phase_since = s.get("phase_since")
         updated_at = s.get("updated_at")
         stale = updated_at and (now - updated_at) > 300  # stale if > 5 min
+        raw_label = s.get("label", "?")
+        removed = raw_label not in configured_labels
+        label = f"[x] {raw_label}" if removed else raw_label
 
         rows.append({
-            "label":    s.get("label", "?"),
+            "label":    label,
+            "removed":  removed,
             "phase":    phase,
             "since":    fmt_time(phase_since),
             "duration": fmt_duration(now - phase_since) if phase_since else "-",
@@ -263,7 +280,9 @@ def main():
 
         line = label_str + color + phase_str + reset + since_str + duration_str + detail_str + next_str
 
-        if r.get("stale") and use_color:
+        if r.get("removed") and use_color:
+            line = RED_DIM + label_str + reset + color + phase_str + reset + RED_DIM + since_str + duration_str + detail_str + next_str + RESET
+        elif r.get("stale") and use_color:
             line = DIM + line + RESET
         elif r.get("is_sub") and use_color:
             # Sub-row: dim label and metadata, keep phase color

@@ -55,13 +55,16 @@ main()
   ├─ load_config() — backward-compat: old streamer_url → single-element streamers
   ├─ create StreamerMonitor per streamer
   ├─ start each monitor in a daemon thread
-  └─ join all threads
+  └─ config watcher loop (30s poll + SIGHUP) → _apply_config_diff()
 
 StreamerMonitor (class)
   ├─ instance vars: url, label, _sl_proc, _ff_proc, _sl_pgid, _ff_pgid
   │                 _session_files, _offline_since, _post_processing
+  │                 _stop_event (per-monitor threading.Event)
   ├─ run()                   — main monitor loop (per-streamer state machine)
-  ├─ stop()                  — send SIGTERM to both process groups
+  ├─ stop()                  — set _stop_event + send SIGTERM to both process groups
+  ├─ _should_stop()          — True if _shutdown_event or _stop_event is set
+  ├─ _interruptible_sleep()  — wakes on either stop event
   ├─ log()                   — auto-prefix [label] on every message
   ├─ _transcribe()           — enqueue video; start _transcribe_worker if not running
   ├─ _do_transcribe()        — actual transcription using passed-in model instance
@@ -72,11 +75,16 @@ _transcribe_queue / _transcribe_lock / _transcribe_worker_running  (module-level
 
 _shutdown_event = threading.Event()
   ├─ SIGTERM/SIGINT → event.set() + all monitor.stop()
-  └─ interruptible_sleep → event.wait(timeout) — no polling
+  └─ _interruptible_sleep → event.wait(timeout) — no polling
+
+_reload_event = threading.Event()
+  └─ SIGHUP → event.set() → config watcher loop triggers immediately
 
 Signal flow:
   SIGTERM/SIGINT → handle_signal() → _shutdown_event.set()
                                    → m.stop() for each monitor
+  SIGHUP         → handle_sighup() → _reload_event.set()
+                                   → _apply_config_diff(old, new)
 ```
 
 ### Post-processing flow (per session)
@@ -131,7 +139,20 @@ Recording uses **MPEG-TS** (`.ts`) format to avoid H.264 花屏 corruption. The 
 - Resets to 60s on live detection
 
 ### Shutdown responsiveness
-`interruptible_sleep()` uses `_shutdown_event.wait(timeout)` — responds immediately when event is set, no polling overhead.
+`_interruptible_sleep()` is an instance method that polls both `_shutdown_event` and `self._stop_event` in 1-second chunks — responds to either within 1s.
+
+### Hot config reload
+`main()` runs a watcher loop (`_shutdown_event.wait(timeout=1)`) that checks `config.json` mtime every 30s, or immediately on SIGHUP. On change, `_apply_config_diff(old, new)` is called:
+- **Removed streamer** (URL no longer in config): `monitor.stop()` → `_stop_event` set → `run()` exits → status file deleted
+- **Added streamer**: new `StreamerMonitor` created, thread started
+- **URL unchanged, name changed**: `monitor.label` updated in place
+- **Global params** (poll intervals, nas settings, quality thresholds…): `monitor.config` reference replaced atomically; picked up on next poll
+- **log_level change**: root logger level updated immediately
+- **Parse error**: warning logged, old config kept — service never crashes on bad JSON
+
+Trigger hot reload: `kill -HUP $(pgrep -f monitor.py)`
+
+`douyin-status` marks streamers whose status file exists but whose label is not in the current config with `[x]` prefix (red dim in color mode). These disappear within seconds once the monitor thread exits.
 
 ### Filename format
 Recording: `抖音_{label}_{YYYYMMDD_HHMMSS}.ts` (raw MPEG-TS)
@@ -225,7 +246,10 @@ CONVERTING: .ts → .mp4 (always; fixes H.264 SPS/PPS avcC corruption issue)
 # Check all streamer statuses:
 douyin-status
 
-# After editing config.json:
+# After editing config.json (hot reload — no restart needed):
+kill -HUP $(pgrep -f monitor.py)
+
+# Full restart (required for output_dir / binary path changes):
 sudo systemctl restart douyin-monitor
 
 # Follow logs:

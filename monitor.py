@@ -17,6 +17,7 @@ from danmaku import DanmakuRecorder
 from pathlib import Path
 
 _shutdown_event = threading.Event()
+_reload_event = threading.Event()
 _all_monitors: list["StreamerMonitor"] = []
 
 # Global transcription queue — shared across all StreamerMonitor instances
@@ -138,6 +139,8 @@ class StreamerMonitor:
         self._postproc_phase: str | None = None
         self._postproc_phase_since: float = 0.0
         self._postproc_detail: str | None = None
+        # Per-monitor stop event: set when this monitor is removed from config
+        self._stop_event = threading.Event()
 
     def log(self, level: int, msg: str, *args) -> None:
         logging.log(level, f"[{self.label}] " + msg, *args)
@@ -188,7 +191,7 @@ class StreamerMonitor:
                     "Network error on live check (attempt %d/%d), retrying in %ds",
                     attempt + 1, retries, wait,
                 )
-                if interruptible_sleep(wait):
+                if self._interruptible_sleep(wait):
                     return None, None
         self.log(logging.WARNING, "All %d live check attempts failed", retries)
         return None, None
@@ -374,8 +377,25 @@ class StreamerMonitor:
         except Exception as e:
             self.log(logging.ERROR, "Outline generation error: %s", e)
 
+    def _should_stop(self) -> bool:
+        """True if this monitor should exit its run() loop."""
+        return _shutdown_event.is_set() or self._stop_event.is_set()
+
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """Sleep up to `seconds`, waking early on global shutdown or per-monitor stop. Returns True if stop requested."""
+        deadline = time.time() + seconds
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if _shutdown_event.wait(timeout=min(remaining, 1.0)):
+                return True
+            if self._stop_event.is_set():
+                return True
+
     def stop(self) -> None:
         """Terminate streamlink so the pipe closes; ffmpeg will see EOF and finalize the MP4 naturally."""
+        self._stop_event.set()
         if self._danmaku_recorder is not None:
             self._danmaku_recorder.stop()
             self._danmaku_recorder = None
@@ -808,16 +828,16 @@ class StreamerMonitor:
             self._save_state()
 
         self._set_phase("IDLE")
-        while not _shutdown_event.is_set():
+        while not self._should_stop():
             is_live, uploader = self.check_live_info_with_retry()
 
-            if _shutdown_event.is_set():
+            if self._should_stop():
                 break
 
             if is_live is None:
                 interval = poll_slow
                 self.log(logging.WARNING, "Network unavailable, backing off %ds", interval)
-                interruptible_sleep(interval)
+                self._interruptible_sleep(interval)
                 continue
 
             if not is_live:
@@ -861,7 +881,7 @@ class StreamerMonitor:
                     self._set_phase("WAITING", f"{len(self._session_files)} file(s) pending")
                 else:
                     self._set_phase("IDLE")
-                interruptible_sleep(interval)
+                self._interruptible_sleep(interval)
                 continue
 
             # Stream is live
@@ -877,7 +897,7 @@ class StreamerMonitor:
             ok = self.start_recording(output_path)
             if not ok:
                 self._set_phase("IDLE")
-                interruptible_sleep(poll_normal)
+                self._interruptible_sleep(poll_normal)
                 continue
 
             self._set_phase("RECORDING", os.path.basename(output_path))
@@ -894,7 +914,7 @@ class StreamerMonitor:
             # Wait for ffmpeg to finish
             try:
                 while self._ff_proc is not None and self._ff_proc.poll() is None:
-                    if _shutdown_event.is_set():
+                    if self._should_stop():
                         self.stop()  # stop streamlink; ffmpeg will get EOF and finalize
                         # Wait up to 30s for ffmpeg to write the moov atom naturally
                         try:
@@ -929,7 +949,7 @@ class StreamerMonitor:
                 self._danmaku_recorder.stop()
                 self._danmaku_recorder = None
 
-            if _shutdown_event.is_set():
+            if self._should_stop():
                 break
 
             # Adaptive quality: capture quality and duration before clearing state
@@ -975,7 +995,7 @@ class StreamerMonitor:
             self._save_state()
 
             self.log(logging.INFO, "Stream ended, waiting 10s before next check...")
-            interruptible_sleep(10)
+            self._interruptible_sleep(10)
 
 
 def handle_signal(signum, frame):
@@ -983,6 +1003,56 @@ def handle_signal(signum, frame):
     _shutdown_event.set()
     for m in _all_monitors:
         m.stop()
+
+
+def handle_sighup(signum, frame):
+    logging.info("Received SIGHUP, triggering config reload")
+    _reload_event.set()
+
+
+def _cleanup_status_file(monitor: "StreamerMonitor", config: dict) -> None:
+    output_dir = config.get("output_dir", ".")
+    path = os.path.join(output_dir, f".douyin_status_{monitor.label}.json")
+    try:
+        os.remove(path)
+        logging.info("Removed stale status file for %s", monitor.label)
+    except FileNotFoundError:
+        pass
+
+
+def _apply_config_diff(old_config: dict, new_config: dict) -> None:
+    old_by_url = {m.url: m for m in _all_monitors}
+    new_streamers = {s["url"]: s for s in new_config["streamers"]}
+
+    # Remove streamers that disappeared from config
+    for url, monitor in list(old_by_url.items()):
+        if url not in new_streamers:
+            logging.info("Config reload: removing streamer %s", monitor.label)
+            monitor.stop()
+            _all_monitors.remove(monitor)
+            _cleanup_status_file(monitor, new_config)
+
+    # Update existing / add new streamers
+    for url, s in new_streamers.items():
+        new_label = s.get("name") or fallback_name_from_url(url)
+        if url in old_by_url:
+            m = old_by_url[url]
+            m.config = new_config  # atomic under GIL; picked up on next poll
+            if m.label != new_label:
+                logging.info("Config reload: renaming %s → %s", m.label, new_label)
+                m.label = new_label
+        else:
+            logging.info("Config reload: adding streamer %s", new_label)
+            m = StreamerMonitor(url, s.get("name"), new_config)
+            _all_monitors.append(m)
+            t = threading.Thread(target=m.run, daemon=True, name=m.label)
+            t.start()
+
+    # Update log level
+    new_level = new_config.get("log_level", "INFO")
+    if old_config.get("log_level", "INFO") != new_level:
+        logging.getLogger().setLevel(getattr(logging, new_level.upper(), logging.INFO))
+        logging.info("Config reload: log level → %s", new_level)
 
 
 def main():
@@ -999,6 +1069,7 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGHUP, handle_sighup)
 
     monitors = [
         StreamerMonitor(s["url"], s.get("name"), config)
@@ -1010,9 +1081,27 @@ def main():
     for t in threads:
         t.start()
 
+    config_path = args.config
+    config_mtime = os.path.getmtime(config_path)
+    last_check = time.time()
+    CONFIG_RELOAD_INTERVAL = 30  # seconds between mtime polls
+
     try:
-        for t in threads:
-            t.join()
+        while not _shutdown_event.wait(timeout=1):
+            now = time.time()
+            if _reload_event.is_set() or (now - last_check >= CONFIG_RELOAD_INTERVAL):
+                _reload_event.clear()
+                last_check = now
+                try:
+                    new_mtime = os.path.getmtime(config_path)
+                    if new_mtime != config_mtime:
+                        new_config = load_config(config_path)
+                        _apply_config_diff(config, new_config)
+                        config = new_config
+                        config_mtime = new_mtime
+                        logging.info("Config reloaded successfully.")
+                except Exception as e:
+                    logging.warning("Config reload failed, keeping current config: %s", e)
     except Exception as e:
         logging.exception("Unexpected error: %s", e)
         sys.exit(1)
