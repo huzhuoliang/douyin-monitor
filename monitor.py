@@ -215,7 +215,8 @@ class StreamerMonitor:
                 preexec_fn=os.setsid,
             )
             ff_proc = subprocess.Popen(
-                [ffmpeg_path, "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-y", output_path],
+                [ffmpeg_path, "-fflags", "+discardcorrupt",
+                 "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-y", output_path],
                 stdin=sl_proc.stdout,
                 preexec_fn=os.setsid,
             )
@@ -274,12 +275,26 @@ class StreamerMonitor:
             f"fontsize={size}:fontcolor=white:"
             f"box=1:boxcolor=black@0.5:boxborderw=4"
         )
-        tmp_path = input_path + ".wm.mp4"
+        # Upscale low-res videos to target height before watermarking, so the
+        # watermark text is proportionally sized and all segments share consistent dimensions.
+        target_height = self.config.get("watermark_target_height", 720)
         ffmpeg_path = self.config["ffmpeg_path"]
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height", "-of", "csv=p=0", input_path],
+            capture_output=True, text=True,
+        )
+        try:
+            video_height = int(probe.stdout.strip())
+        except (ValueError, AttributeError):
+            video_height = target_height  # fallback: assume no upscale needed
+        scale_prefix = f"scale=-2:{target_height}," if video_height < target_height else ""
+        vf = f"{scale_prefix}{drawtext}"
+        tmp_path = input_path + ".wm.mp4"
         try:
             result = subprocess.run(
                 [ffmpeg_path, "-i", input_path,
-                 "-vf", drawtext,
+                 "-vf", vf,
                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                  "-threads", str(threads),
                  "-c:a", "copy",
@@ -445,7 +460,8 @@ class StreamerMonitor:
                     self._set_postproc_phase("CONVERTING", os.path.basename(f))
                     self.log(logging.INFO, "Converting TS→MP4: %s", os.path.basename(f))
                     conv_result = subprocess.run(
-                        [ffmpeg_path, "-i", f, "-c", "copy", "-y", mp4_path],
+                        [ffmpeg_path, "-fflags", "+discardcorrupt",
+                         "-i", f, "-c", "copy", "-y", mp4_path],
                         capture_output=True,
                         text=True,
                     )
@@ -1052,7 +1068,7 @@ class StreamerMonitor:
                     ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
                     upgrade_thresh = self.config.get("quality_upgrade_threshold", 300)
                     if rec_duration >= upgrade_thresh and self._quality_index > 0:
-                        self._quality_index -= 1
+                        self._quality_index = 0  # Jump directly to best; downgrade step-by-step if it fails
                         self.log(logging.INFO, "Upgrading quality → %s (stable recording %ds)",
                                  ladder[self._quality_index], rec_duration)
                 _ended_at = int(time.time())

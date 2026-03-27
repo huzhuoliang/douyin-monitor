@@ -286,10 +286,15 @@ python3 monitor.py --config config.json
 - `quality_index`: current position in ladder (0 = best); survives restart
 - `segment_quality`: `{path: quality_string}` map; used by `_add_watermark()` to label each segment
 
+**Upgrade behavior**: on upgrade, `quality_index` is reset to **0 (best)** directly — not stepped by 1. Reason: Douyin streams typically only have `best` and `worst`; intermediate qualities (720p, 480p) don't exist for most streamers and fail immediately, so step-by-step upgrade can never escape `worst`. Downgrade still steps by 1 to find the stable tier quickly.
+
 **Quality label mapping** (class-level `_QUALITY_LABELS` dict):
 - `best/hd/1080p/720p` → 超清/高清 ; `sd/480p/md/360p` → 标清/流畅 ; `ld/worst` → 流畅
-- Font changed to `NotoSansCJK-Regular.ttc` (default) to support Chinese glyphs
+- Font: `NotoSansCJK-Regular.ttc` (default) to support Chinese glyphs
 - `watermark_font` in config overrides the font path
+- `watermark_target_height` (default `720`): before watermarking, low-res segments (height < target) are upscaled to this height so watermark text is proportionally sized and all segments have consistent dimensions. High-res segments are not downscaled.
+
+**Corrupt packet handling**: Recording ffmpeg uses `-fflags +discardcorrupt` to silently discard corrupt FLV packets instead of crashing with exit code 183. Same flag applied during TS→MP4 conversion. Root cause: Douyin CDN occasionally delivers corrupt FLV packets mid-stream.
 
 ### Notification config fields
 
