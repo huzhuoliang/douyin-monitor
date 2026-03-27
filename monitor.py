@@ -132,6 +132,10 @@ class StreamerMonitor:
         self._danmaku_recorder: DanmakuRecorder | None = None
         self._quality_index: int = 0             # index into quality_ladder; 0 = best
         self._segment_quality: dict[str, str] = {}  # path → quality string, for watermarking
+        # Notification deduplication across reconnects in the same session
+        self._session_notified_live: bool = False   # True after stream_live sent for this session
+        self._pending_ended_payload: dict | None = None  # stream_ended payload buffered until offline confirmed
+        self._pending_ended_at: float = 0.0         # wall time when the pending payload was buffered
         self._phase: str = "STARTING"
         self._phase_since: float = time.time()
         self._phase_detail: str | None = None
@@ -722,6 +726,7 @@ class StreamerMonitor:
             "current_recording": self._current_recording,
             "quality_index": self._quality_index,
             "segment_quality": self._segment_quality,
+            "session_notified_live": self._session_notified_live,
         }
         tmp = self._state_path + ".tmp"
         try:
@@ -746,6 +751,7 @@ class StreamerMonitor:
             self._current_recording = state.get("current_recording")
             self._quality_index = int(state.get("quality_index", 0))
             self._segment_quality = state.get("segment_quality") or {}
+            self._session_notified_live = bool(state.get("session_notified_live", False))
             self.log(logging.INFO,
                 "Restored state: consecutive_offline=%d, session_files=%d, postproc_files=%d, quality_index=%d",
                 self._consecutive_offline, len(self._session_files), len(self._postproc_files), self._quality_index,
@@ -945,6 +951,16 @@ class StreamerMonitor:
                     interval = poll_normal
                 self.log(logging.DEBUG, "Offline (check #%d), next check in %ds", self._consecutive_offline, interval)
 
+                # Send buffered stream_ended once offline long enough to confirm it's genuine
+                notify_delay = self.config.get("notify_offline_delay", 120)
+                if (
+                    self._pending_ended_payload is not None
+                    and self._offline_since is not None
+                    and time.time() - self._offline_since >= notify_delay
+                ):
+                    self._notify(self._pending_ended_payload)
+                    self._pending_ended_payload = None
+
                 # Trigger post-processing if offline long enough
                 delay = self.config.get("post_process_delay", 1800)
                 if (
@@ -954,6 +970,11 @@ class StreamerMonitor:
                     and self._session_files
                     and not self._post_processing
                 ):
+                    # Flush any remaining pending notification before clearing session
+                    if self._pending_ended_payload is not None:
+                        self._notify(self._pending_ended_payload)
+                        self._pending_ended_payload = None
+                    self._session_notified_live = False
                     self._post_processing = True
                     files_to_process = self._session_files[:]
                     self._session_files = []
@@ -967,6 +988,17 @@ class StreamerMonitor:
                         name=f"{self.label}-postproc",
                     )
                     t.start()
+                elif (
+                    not self.config.get("nas_enabled", False)
+                    and self._offline_since is not None
+                    and time.time() - self._offline_since >= delay
+                    and self._session_notified_live
+                ):
+                    # NAS disabled: still reset session tracking so the next broadcast
+                    # is treated as a new session and gets a fresh stream_live notification.
+                    self._session_notified_live = False
+                    self._session_files = []
+                    self._save_state()
 
                 self._next_poll_at = time.time() + interval
                 if self._session_files:
@@ -979,6 +1011,8 @@ class StreamerMonitor:
             # Stream is live
             self._consecutive_offline = 0
             self._offline_since = None  # reset offline timer; keep _session_files for this session
+            # Cancel buffered stream_ended — this is a reconnect, not a real stream end
+            self._pending_ended_payload = None
             self._save_state()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"抖音_{self.label}_{timestamp}.ts"
@@ -993,15 +1027,18 @@ class StreamerMonitor:
                 continue
 
             self._set_phase("RECORDING", os.path.basename(output_path))
-            self._notify({
-                "msg_type": "text",
-                "event": "stream_live",
-                "label": self.label,
-                "url": self.url,
-                "uploader": uploader or self.label,
-                "started_at_str": datetime.fromtimestamp(self._rec_start_ts).strftime("%Y-%m-%d %H:%M:%S"),
-                "output_path": output_path,
-            })
+            # Only notify on first recording of this session (suppress reconnect spam)
+            if not self._session_notified_live:
+                self._session_notified_live = True
+                self._notify({
+                    "msg_type": "text",
+                    "event": "stream_live",
+                    "label": self.label,
+                    "url": self.url,
+                    "uploader": uploader or self.label,
+                    "started_at_str": datetime.fromtimestamp(self._rec_start_ts).strftime("%Y-%m-%d %H:%M:%S"),
+                    "output_path": output_path,
+                })
 
             # Wait for ffmpeg to finish
             try:
@@ -1072,7 +1109,9 @@ class StreamerMonitor:
                         self.log(logging.INFO, "Upgrading quality → %s (stable recording %ds)",
                                  ladder[self._quality_index], rec_duration)
                 _ended_at = int(time.time())
-                self._notify({
+                # Buffer stream_ended; send only after notify_offline_delay seconds of confirmed offline.
+                # If the stream reconnects before the delay, the payload is cancelled — no spam.
+                self._pending_ended_payload = {
                     "msg_type": "text",
                     "event": "stream_ended",
                     "label": self.label,
@@ -1081,7 +1120,8 @@ class StreamerMonitor:
                     "started_at_str": datetime.fromtimestamp(self._rec_start_ts).strftime("%Y-%m-%d %H:%M:%S") if self._rec_start_ts else "",
                     "duration_seconds": _ended_at - (self._rec_start_ts or _ended_at),
                     "file_size_mb": round(os.path.getsize(output_path) / (1024 * 1024), 1) if os.path.exists(output_path) else 0,
-                })
+                }
+                self._pending_ended_at = float(_ended_at)
             self._current_recording = None
             self._rec_start_ts = None
             self._save_state()
