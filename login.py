@@ -57,9 +57,18 @@ def _get(opener, url, extra_headers=None):
 
 
 def update_config(config_path, cookie_str):
+    # Write cookie string to a separate file next to config.json
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    cookie_file = os.path.join(config_dir, "danmaku_cookies.txt")
+    cookie_tmp = cookie_file + ".tmp"
+    with open(cookie_tmp, "w", encoding="utf-8") as f:
+        f.write(cookie_str)
+    os.replace(cookie_tmp, cookie_file)
+
+    # Store the absolute path to the cookie file in config (not the raw string)
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
-    config["danmaku_cookies"] = cookie_str
+    config["danmaku_cookies"] = cookie_file
     tmp = config_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -133,8 +142,8 @@ def mode_paste(config_path: str) -> None:
     try:
         update_config(config_path, raw)
     except Exception as e:
-        print(f"写入 config.json 失败: {e}")
-        print("Cookie 字符串（请手动填入 danmaku_cookies）:")
+        print(f"写入失败: {e}")
+        print("Cookie 字符串（请手动保存到 danmaku_cookies.txt，并在 config.json 中将 danmaku_cookies 设为该文件路径）:")
         print(f"  {raw}")
         sys.exit(1)
 
@@ -288,8 +297,8 @@ def mode_qr(config_path: str) -> None:
             try:
                 update_config(config_path, cookie_str)
             except Exception as e:
-                print(f"写入 config.json 失败: {e}")
-                print(f"请手动填入 danmaku_cookies:\n  {cookie_str}")
+                print(f"写入失败: {e}")
+                print(f"请手动保存到 danmaku_cookies.txt 并将路径填入 danmaku_cookies:\n  {cookie_str}")
                 sys.exit(1)
 
             print(f"Cookie 字段: {', '.join(cookie_map.keys())}")

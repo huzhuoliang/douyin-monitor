@@ -2,6 +2,7 @@
 """Douyin Live Stream Monitor & Auto-Recorder"""
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -201,8 +202,12 @@ class StreamerMonitor:
         self.log(logging.WARNING, "All %d live check attempts failed", retries)
         return None, None
 
-    def start_recording(self, output_path: str) -> bool:
-        """Start streamlink | ffmpeg pipeline. Returns True on success."""
+    def start_recording(self, output_path: str) -> str | None:
+        """Start streamlink | ffmpeg pipeline.
+
+        Returns the effective output descriptor on success (single file path in normal mode,
+        manifest file path in segment mode), or None on failure.
+        """
         streamlink_path = self.config["streamlink_path"]
         if self.config.get("adaptive_quality", True):
             ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
@@ -211,19 +216,65 @@ class StreamerMonitor:
             quality = self.config.get("streamlink_quality", "best")
         ffmpeg_path = self.config["ffmpeg_path"]
 
-        self.log(logging.INFO, "Starting recording [quality=%s]: %s", quality, output_path)
+        segment_duration = self.config.get("segment_duration", 0)
+        use_segments = bool(segment_duration and segment_duration > 0)
+
+        self.log(logging.INFO, "Starting recording [quality=%s, segments=%s]: %s",
+                 quality, f"{segment_duration}s" if use_segments else "off", output_path)
         try:
             sl_proc = subprocess.Popen(
                 [streamlink_path, "--stdout", self.url, quality],
                 stdout=subprocess.PIPE,
                 preexec_fn=os.setsid,
             )
-            ff_proc = subprocess.Popen(
-                [ffmpeg_path, "-fflags", "+discardcorrupt",
-                 "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-y", output_path],
-                stdin=sl_proc.stdout,
-                preexec_fn=os.setsid,
-            )
+
+            if use_segments:
+                # Derive session timestamp from the computed output_path filename
+                m = re.search(r"(\d{8}_\d{6})", os.path.basename(output_path))
+                session_ts = m.group(1) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
+                base = os.path.splitext(output_path)[0]  # strip .ts
+                manifest_path = base + "_segs.txt"
+                output_dir_str = os.path.dirname(output_path)
+                safe_label = sanitize_filename(self.label)
+                seg_pattern = os.path.join(output_dir_str, f"抖音_{safe_label}_%Y%m%d_%H%M%S.ts")
+
+                ff_proc = subprocess.Popen(
+                    [ffmpeg_path, "-fflags", "+discardcorrupt",
+                     "-i", "pipe:0",
+                     "-f", "segment",
+                     "-segment_time", str(segment_duration),
+                     "-strftime", "1",
+                     "-reset_timestamps", "0",
+                     "-segment_list", manifest_path,
+                     "-segment_list_type", "flat",
+                     "-c", "copy",
+                     "-y", seg_pattern],
+                    stdin=sl_proc.stdout,
+                    preexec_fn=os.setsid,
+                )
+                descriptor = manifest_path
+                self._current_recording = {
+                    "path": None,
+                    "manifest": manifest_path,
+                    "segment_pattern_dir": output_dir_str,
+                    "session_ts": session_ts,
+                    "rec_start_ts": int(time.time()),
+                    "quality": quality,
+                }
+            else:
+                ff_proc = subprocess.Popen(
+                    [ffmpeg_path, "-fflags", "+discardcorrupt",
+                     "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "-y", output_path],
+                    stdin=sl_proc.stdout,
+                    preexec_fn=os.setsid,
+                )
+                descriptor = output_path
+                self._current_recording = {
+                    "path": output_path,
+                    "rec_start_ts": int(time.time()),
+                    "quality": quality,
+                }
+
             # Release our reference so ffmpeg holds the only read end
             sl_proc.stdout.close()
 
@@ -231,22 +282,22 @@ class StreamerMonitor:
             self._ff_proc = ff_proc
             self._sl_pgid = os.getpgid(sl_proc.pid)
             self._ff_pgid = os.getpgid(ff_proc.pid)
-            self._rec_start_ts = int(time.time())
-            self._current_recording = {"path": output_path, "rec_start_ts": self._rec_start_ts, "quality": quality}
+            self._rec_start_ts = self._current_recording["rec_start_ts"]
             self._save_state()
 
             if self.config.get("danmaku_enabled", False):
                 if self._danmaku_recorder is not None:
                     self._danmaku_recorder.stop()
                     self._danmaku_recorder = None
+                # Danmaku is always a single session-level file
                 danmaku_path = os.path.splitext(output_path)[0] + ".danmaku.jsonl"
                 self._danmaku_recorder = DanmakuRecorder(self.url, danmaku_path, self.config, self.label)
                 self._danmaku_recorder.start()
 
-            return True
+            return descriptor
         except Exception as e:
             self.log(logging.ERROR, "Failed to start recording: %s", e)
-            return False
+            return None
 
     # Quality label → display name (Chinese)
     _QUALITY_LABELS: dict[str, str] = {
@@ -759,6 +810,70 @@ class StreamerMonitor:
         except Exception as e:
             self.log(logging.WARNING, "Failed to load state (ignoring): %s", e)
 
+    def _read_segment_manifest(self, manifest_path: str) -> list[str]:
+        """Read a flat-text ffmpeg segment manifest and return absolute paths."""
+        if not os.path.exists(manifest_path):
+            return []
+        paths = []
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not os.path.isabs(line):
+                        line = os.path.join(os.path.dirname(manifest_path), line)
+                    paths.append(line)
+        except Exception as e:
+            self.log(logging.WARNING, "Failed to read segment manifest %s: %s", manifest_path, e)
+        return paths
+
+    def _find_orphan_segments(
+        self,
+        session_ts: str,
+        output_dir: str,
+        known_paths: list[str],
+    ) -> list[str]:
+        """Find in-progress segment files not yet written to the manifest (crash recovery)."""
+        safe_label = sanitize_filename(self.label)
+        pattern = os.path.join(output_dir, f"抖音_{safe_label}_????????_??????.ts")
+        candidates = sorted(glob.glob(pattern))
+
+        known_set = {os.path.abspath(p) for p in known_paths}
+
+        try:
+            session_dt = datetime.strptime(session_ts, "%Y%m%d_%H%M%S")
+        except ValueError:
+            self.log(logging.WARNING, "Cannot parse session_ts '%s' for orphan segment search", session_ts)
+            return []
+
+        orphans = []
+        for candidate in candidates:
+            abs_candidate = os.path.abspath(candidate)
+            if abs_candidate in known_set:
+                continue
+            m = re.search(r"(\d{8}_\d{6})", os.path.basename(candidate))
+            if not m:
+                continue
+            try:
+                seg_dt = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            if seg_dt < session_dt:
+                continue
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", candidate],
+                capture_output=True, text=True,
+            )
+            if probe.returncode == 0:
+                self.log(logging.INFO, "Found valid orphan segment: %s", os.path.basename(candidate))
+                orphans.append(abs_candidate)
+            else:
+                self.log(logging.WARNING, "Orphan segment failed validation, skipping: %s",
+                         os.path.basename(candidate))
+        return orphans
+
     def _notify(self, payload: dict) -> None:
         """POST to Feishu webhook and/or Telegram bot. Non-fatal."""
         import urllib.request
@@ -890,8 +1005,40 @@ class StreamerMonitor:
         # Recovery: handle recording interrupted by a previous restart
         if self._current_recording is not None:
             rec = self._current_recording
-            rec_path = rec.get("path", "")
-            if rec_path and os.path.exists(rec_path):
+            rec_path = rec.get("path") or ""
+            manifest_path = rec.get("manifest") or ""
+            rec_quality = rec.get("quality", "best")
+
+            if manifest_path:
+                # Segment mode recovery
+                self.log(logging.INFO, "Recovering interrupted segmented recording (manifest: %s)",
+                         os.path.basename(manifest_path))
+                session_ts = rec.get("session_ts", "")
+                output_dir_str = rec.get("segment_pattern_dir", str(output_dir))
+
+                completed = self._read_segment_manifest(manifest_path)
+                for seg in completed:
+                    if os.path.exists(seg) and seg not in self._session_files:
+                        self._session_files.append(seg)
+                        self._segment_quality[seg] = rec_quality
+
+                orphans = self._find_orphan_segments(session_ts, output_dir_str, completed)
+                for seg in orphans:
+                    if seg not in self._session_files:
+                        self._session_files.append(seg)
+                        self._segment_quality[seg] = rec_quality
+
+                self.log(logging.INFO, "Segment recovery: %d completed + %d orphan(s)",
+                         len(completed), len(orphans))
+
+                if self.config.get("danmaku_enabled", False):
+                    danmaku_path = manifest_path.removesuffix("_segs.txt") + ".danmaku.jsonl"
+                    self.log(logging.INFO, "Resuming danmaku capture → %s", os.path.basename(danmaku_path))
+                    self._danmaku_recorder = DanmakuRecorder(self.url, danmaku_path, self.config, self.label)
+                    self._danmaku_recorder.start()
+
+            elif rec_path and os.path.exists(rec_path):
+                # Single-file mode recovery (original logic)
                 self.log(logging.INFO, "Recovering interrupted recording: %s", os.path.basename(rec_path))
                 if rec_path not in self._session_files:
                     self._session_files.append(rec_path)
@@ -1020,13 +1167,13 @@ class StreamerMonitor:
 
             self._next_poll_at = None
             self._set_phase("CONNECTING")
-            ok = self.start_recording(output_path)
-            if not ok:
+            descriptor = self.start_recording(output_path)
+            if not descriptor:
                 self._set_phase("IDLE")
                 self._interruptible_sleep(poll_normal)
                 continue
 
-            self._set_phase("RECORDING", os.path.basename(output_path))
+            self._set_phase("RECORDING", os.path.basename(descriptor))
             # Only notify on first recording of this session (suppress reconnect spam)
             if not self._session_notified_live:
                 self._session_notified_live = True
@@ -1097,10 +1244,7 @@ class StreamerMonitor:
                                  ladder[min(self._quality_index, len(ladder) - 1)])
                 self._set_phase("IDLE")
             else:
-                self.log(logging.INFO, "Recording finished: %s", output_path)
-                self._segment_quality[output_path] = rec_quality
-                self._session_files.append(output_path)
-                # Upgrade quality after a long stable recording
+                # Upgrade quality after a long stable recording (applies to both single-file and segment mode)
                 if self.config.get("adaptive_quality", True):
                     ladder = self.config.get("streamlink_quality_ladder", ["best", "720p", "480p", "worst"])
                     upgrade_thresh = self.config.get("quality_upgrade_threshold", 300)
@@ -1108,7 +1252,42 @@ class StreamerMonitor:
                         self._quality_index = 0  # Jump directly to best; downgrade step-by-step if it fails
                         self.log(logging.INFO, "Upgrading quality → %s (stable recording %ds)",
                                  ladder[self._quality_index], rec_duration)
-                _ended_at = int(time.time())
+
+                rec = self._current_recording or {}
+                segment_duration = self.config.get("segment_duration", 0)
+                if segment_duration and segment_duration > 0 and rec.get("manifest"):
+                    # Segment mode: read manifest to collect all completed segments
+                    manifest_path = rec["manifest"]
+                    completed_segs = self._read_segment_manifest(manifest_path)
+                    for seg in completed_segs:
+                        if seg not in self._session_files:
+                            self._session_files.append(seg)
+                            self._segment_quality[seg] = rec_quality
+                    seg_count = len(completed_segs)
+                    self.log(logging.INFO, "Recording finished: %d segment(s) (manifest: %s)",
+                             seg_count, os.path.basename(manifest_path))
+                    _ended_at = int(time.time())
+                    if seg_count == 1:
+                        display_filename = os.path.basename(completed_segs[0])
+                        file_size_mb = round(os.path.getsize(completed_segs[0]) / (1024 * 1024), 1) if os.path.exists(completed_segs[0]) else 0
+                    elif seg_count > 1:
+                        display_filename = f"{seg_count} segments"
+                        file_size_mb = sum(
+                            round(os.path.getsize(s) / (1024 * 1024), 1)
+                            for s in completed_segs if os.path.exists(s)
+                        )
+                    else:
+                        display_filename = os.path.basename(manifest_path)
+                        file_size_mb = 0
+                else:
+                    # Single-file mode
+                    self.log(logging.INFO, "Recording finished: %s", output_path)
+                    self._segment_quality[output_path] = rec_quality
+                    self._session_files.append(output_path)
+                    _ended_at = int(time.time())
+                    display_filename = os.path.basename(output_path)
+                    file_size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 1) if os.path.exists(output_path) else 0
+
                 # Buffer stream_ended; send only after notify_offline_delay seconds of confirmed offline.
                 # If the stream reconnects before the delay, the payload is cancelled — no spam.
                 self._pending_ended_payload = {
@@ -1116,10 +1295,10 @@ class StreamerMonitor:
                     "event": "stream_ended",
                     "label": self.label,
                     "url": self.url,
-                    "filename": os.path.basename(output_path),
+                    "filename": display_filename,
                     "started_at_str": datetime.fromtimestamp(self._rec_start_ts).strftime("%Y-%m-%d %H:%M:%S") if self._rec_start_ts else "",
                     "duration_seconds": _ended_at - (self._rec_start_ts or _ended_at),
-                    "file_size_mb": round(os.path.getsize(output_path) / (1024 * 1024), 1) if os.path.exists(output_path) else 0,
+                    "file_size_mb": file_size_mb,
                 }
                 self._pending_ended_at = float(_ended_at)
             self._current_recording = None

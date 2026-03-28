@@ -355,7 +355,15 @@ class DanmakuRecorder:
         string is: config cookies + any new cookies set by the server, with
         config values taking priority for overlapping names.
         """
-        custom_cookies: str = self.config.get("danmaku_cookies") or ""
+        raw_cookie_val: str = self.config.get("danmaku_cookies") or ""
+        if raw_cookie_val and os.path.isfile(raw_cookie_val):
+            try:
+                with open(raw_cookie_val, encoding="utf-8") as _cf:
+                    raw_cookie_val = _cf.read().strip()
+            except OSError as _e:
+                logging.warning("Failed to read danmaku_cookies file %s: %s", raw_cookie_val, _e)
+                raw_cookie_val = ""
+        custom_cookies: str = raw_cookie_val
 
         # Parse config cookies into a dict (used for merging later)
         config_dict: dict[str, str] = {}

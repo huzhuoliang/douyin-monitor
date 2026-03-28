@@ -11,6 +11,7 @@
   "quality_downgrade_threshold": 60,
   "quality_upgrade_threshold": 300,
   "ffmpeg_path": "/usr/bin/ffmpeg",
+  "segment_duration": 0,
   "cookies_from_browser": null,
   "poll_interval_online": 30,
   "poll_interval_slow": 60,

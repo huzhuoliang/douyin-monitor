@@ -19,6 +19,7 @@ The following information is **never committed to git**. Real values live in loc
 
 **Gitignored files** (exist on disk, never pushed):
 - `config.json` — runtime config with real values; use `config.example.json` as template
+- `danmaku_cookies.txt` — raw cookie string written by `login.py`; `danmaku_cookies` in config.json stores the path to this file
 - `CLAUDE.local.md` — personal deployment notes (paths, streamer list, credentials)
 
 **When adding new sensitive fields** to `config.json`:
@@ -66,9 +67,11 @@ StreamerMonitor (class)
   ├─ _should_stop()          — True if _shutdown_event or _stop_event is set
   ├─ _interruptible_sleep()  — wakes on either stop event
   ├─ log()                   — auto-prefix [label] on every message
-  ├─ _transcribe()           — enqueue video; start _transcribe_worker if not running
-  ├─ _do_transcribe()        — actual transcription using passed-in model instance
-  └─ _post_process_session() — validate → merge → rsync → cleanup (daemon thread)
+  ├─ _transcribe()              — enqueue video; start _transcribe_worker if not running
+  ├─ _do_transcribe()           — actual transcription using passed-in model instance
+  ├─ _read_segment_manifest()   — parse ffmpeg flat segment list → list of abs paths
+  ├─ _find_orphan_segments()    — glob for .ts files ≥ session_ts not in manifest (crash recovery)
+  └─ _post_process_session()    — validate → merge → rsync → cleanup (daemon thread)
 
 _transcribe_queue / _transcribe_lock / _transcribe_worker_running  (module-level globals)
   └─ _transcribe_worker() — load model → drain queue → del model + gc.collect()
@@ -124,6 +127,8 @@ _post_process_session() started in daemon thread "{label}-postproc"
 ### Dual-process recording pipeline
 `streamlink --stdout` pipes the raw stream into `ffmpeg -i pipe:0 -f mpegts`. Each process gets its own setsid process group. On shutdown, both pgids receive SIGTERM independently.
 
+**Segment mode** (`segment_duration > 0`): ffmpeg uses `-f segment -segment_time N -strftime 1 -segment_list manifest.txt` to split output into fixed-duration TS files. Each segment is named `抖音_{label}_{YYYYMMDD_HHMMSS}.ts` (strftime). `start_recording()` returns the manifest path (not output_path) as the descriptor; `_current_recording` stores `{manifest, segment_pattern_dir, session_ts, ...}`. On clean exit, `_read_segment_manifest()` collects all completed segments. On crash recovery, `_find_orphan_segments()` additionally globs for TS files ≥ session_ts not yet in the manifest (the in-progress segment ffmpeg hadn't flushed).
+
 Recording uses **MPEG-TS** (`.ts`) format to avoid H.264 花屏 corruption. The root cause: when recording to MP4 via pipe with `-c copy`, ffmpeg writes the initial SPS/PPS into the `avcC` atom once; if the Douyin CDN reconnects mid-stream and the new HLS segment carries different SPS/PPS inline, players decode against the stale `avcC` and produce garbled video while audio remains normal. MPEG-TS uses Annex B format where each keyframe carries inline SPS/PPS — no `avcC` atom, no stale header issue. The `.ts` → `.mp4` conversion in post-processing (from a complete file, not a pipe) correctly builds the `avcC` from the full bitstream.
 
 ### Single network call per poll cycle
@@ -164,6 +169,9 @@ After post-processing conversion: `抖音_{label}_{YYYYMMDD_HHMMSS}.mp4`
 
 ### Cookie auth
 `cookies_from_browser` in config.json (e.g. `"chrome"`). Currently unused by streamlink backend — kept for future use. Set `null`.
+
+### Danmaku cookie file
+`danmaku_cookies` in config.json can be either a raw cookie string **or a file path**. `login.py` writes the cookie string to `danmaku_cookies.txt` (next to config.json) and stores the file path in config — avoids embedding long cookie strings directly in JSON. `DanmakuRecorder._build_cookie_header()` detects a file path via `os.path.isfile()` and reads the string from the file at connection time.
 
 ---
 
@@ -263,6 +271,12 @@ python3 monitor.py --config config.json
 ```
 
 ---
+
+### Recording config fields
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `segment_duration` | `0` | Seconds per segment; `0` = single-file mode (original behavior) |
 
 ### Post-processing config fields
 
@@ -378,15 +392,15 @@ Fields saved:
 | `offline_since` | Wall time of offline transition — post-process delay continues counting |
 | `session_files` | List of recorded segments accumulating this session |
 | `postproc_files` | Files handed to the active postproc thread — set at trigger time, cleared in `finally`; non-empty on restart → auto-retry |
-| `current_recording` | `{path, rec_start_ts}` of the active recording — recovered into `_session_files` on restart |
+| `current_recording` | Active recording state — recovered on restart. Single-file mode: `{path, rec_start_ts, quality}`. Segment mode: `{path: null, manifest, segment_pattern_dir, session_ts, rec_start_ts, quality}` |
 
 **Write path**: every meaningful state change calls `_save_state()` which writes to `{path}.tmp` then `os.replace()` (atomic). No partially-written state files.
 
 **Recovery flow** (at `run()` startup):
 1. `_load_state()` restores all five fields
 2. If `current_recording` is non-None → interrupted recording detected:
-   - File exists on disk → add to `_session_files` (watermark 统一在 `_post_process_session` Step 0 执行)
-   - File missing → log warning, skip
+   - **Single-file mode** (`path` non-None): file exists → add to `_session_files`; missing → log warning skip
+   - **Segment mode** (`manifest` non-None): `_read_segment_manifest()` → add completed segs; `_find_orphan_segments()` → add any valid in-progress seg not yet flushed to manifest
    - Clear `current_recording`, save state
 3. If `postproc_files` is non-empty → post-processing was interrupted mid-run:
    - Spawn a new postproc thread immediately with those files

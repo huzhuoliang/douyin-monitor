@@ -3,6 +3,9 @@ TODO.md
 # Local config with real credentials/URLs (use config.example.json as template)
 config.json
 
+# Danmaku session cookies (written by login.py; referenced by danmaku_cookies in config.json)
+danmaku_cookies.txt
+
 # Local notes with personal paths, streamer info, credentials
 CLAUDE.local.md
 
