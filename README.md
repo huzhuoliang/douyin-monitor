@@ -111,9 +111,9 @@ douyin-status
 ```
 LABEL    PHASE        SINCE     DURATION  DETAIL                      NEXT
 ────────────────────────────────────────────────────────────────────────────────────────────
-主播A     RECORDING    21:18:04  3h27m10s  主播A_20260310_211804.mp4   waiting for stream end
-主播C WAITING      23:38:51  14m35s    1 file(s) pending           post-proc @ 01:59 (15m)
-主播B     IDLE         00:56:07  1h05m34s  offline 1h05m  45 checks    poll in 55s (@ 02:02:15)
+主播A    RECORDING    21:18:04  3h27m10s  主播A_20260310_211804.mp4  waiting for stream end
+主播B    WAITING      23:38:51  14m35s    1 file(s) pending           post-proc @ 01:59 (15m)
+主播C    IDLE         00:56:07  1h05m34s  offline 1h05m  45 checks    poll in 55s (@ 02:02:15)
 ────────────────────────────────────────────────────────────────────────────────────────────
   2026-03-11 01:03:00  |  3 streamer(s)  |  output: /path/to/recordings
 ```
@@ -186,10 +186,10 @@ python3 ~/claude-workspace/douyin_monitor/monitor.py --config ~/claude-workspace
 每个主播对应一个 `StreamerMonitor` 实例，运行在独立线程中，互不干扰。日志每条带 `[主播标签]` 前缀便于区分：
 
 ```
-[主播1] Starting monitor for: https://live.douyin.com/ROOM_ID_1
-[主播2] Starting monitor for: https://live.douyin.com/ROOM_ID_2
+[主播A] Starting monitor for: https://live.douyin.com/ROOM_ID_1
+[主播B] Starting monitor for: https://live.douyin.com/ROOM_ID_2
 [主播A] Starting recording: 抖音_主播A_20260308_230537.mp4
-[主播C] Starting recording: 抖音_主播C_20260308_230537.mp4
+[主播B] Starting recording: 抖音_主播B_20260308_230537.mp4
 ```
 
 ### 状态机（每路独立）
