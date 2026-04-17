@@ -1269,13 +1269,11 @@ class StreamerMonitor:
                     _ended_at = int(time.time())
                     if seg_count == 1:
                         display_filename = os.path.basename(completed_segs[0])
-                        file_size_mb = round(os.path.getsize(completed_segs[0]) / (1024 * 1024), 1) if os.path.exists(completed_segs[0]) else 0
+                        file_size_mb = round(os.path.getsize(completed_segs[0]) / (1024 * 1024), 2) if os.path.exists(completed_segs[0]) else 0
                     elif seg_count > 1:
                         display_filename = f"{seg_count} segments"
-                        file_size_mb = sum(
-                            round(os.path.getsize(s) / (1024 * 1024), 1)
-                            for s in completed_segs if os.path.exists(s)
-                        )
+                        total_bytes = sum(os.path.getsize(s) for s in completed_segs if os.path.exists(s))
+                        file_size_mb = round(total_bytes / (1024 * 1024), 2)
                     else:
                         display_filename = os.path.basename(manifest_path)
                         file_size_mb = 0
@@ -1286,7 +1284,7 @@ class StreamerMonitor:
                     self._session_files.append(output_path)
                     _ended_at = int(time.time())
                     display_filename = os.path.basename(output_path)
-                    file_size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 1) if os.path.exists(output_path) else 0
+                    file_size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2) if os.path.exists(output_path) else 0
 
                 # Buffer stream_ended; send only after notify_offline_delay seconds of confirmed offline.
                 # If the stream reconnects before the delay, the payload is cancelled — no spam.
